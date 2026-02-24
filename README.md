@@ -6,9 +6,6 @@
 
 </div>
 
-## Project Rename
-This project is renamed to **OmniFetch**.
-
 ## Overview
 OmniFetch is a Tampermonkey userscript that detects playable media on web pages and gives you a direct download flow.
 
