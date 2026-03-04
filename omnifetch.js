@@ -15,6 +15,9 @@
 // @connect      *
 // ==/UserScript==
 
+/* eslint-env browser */
+/* global GM_download, GM_xmlhttpRequest, GM_addStyle, GM_getValue, GM_setValue, unsafeWindow */
+
 // NOTE: @require for FFmpeg removed — it is now lazy-loaded only when muxing is needed.
 // NOTE: @connect * is required for universal media downloading across CDNs.
 //       A per-site enable/disable toggle is provided in the settings panel.
@@ -22,6 +25,7 @@
 (function () {
   "use strict";
 
+  const SCRIPT_VERSION = "26.2";
   const HOST = window.location.hostname;
   const uWindow = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
 
@@ -30,43 +34,61 @@
   // =========================================================================
 
   const DEFAULT_SETTINGS = {
-    enabled: true, // Master switch
-    enabledSites: {}, // Per-host overrides: { "example.com": false }
-    maxMSEMemoryMB: 6144, // Hard cap on MSE buffer capture (MB) — 6 GB
-    hlsConcurrency: 4, // Parallel HLS segment downloads
     dashConcurrency: 4, // Parallel DASH segment downloads
-    requestTimeoutText: 15000, // Timeout for text/json fetches (ms)
-    requestTimeoutBlob: 60000, // Timeout for blob/binary fetches (ms)
-    maxRetries: 2, // Retry count on network failure
-    enableThirdPartyYT: false, // YouTube via external converter (opt-in)
-    enableTelegram: true, // Telegram download module
-    enableYouTube: true, // YouTube download routing
-    enableTwitter: true, // Twitter/X video extraction
-    enableReddit: true, // Reddit → RapidSave routing
     enableMSECapture: true, // MSE buffer interception
     enableNetworkSniff: true, // fetch/XHR hook for manifest detection
+    enableReddit: true, // Reddit → RapidSave routing
+    enableTelegram: true, // Telegram download module
+    enableThirdPartyYT: false, // YouTube via external converter (opt-in)
+    enableTwitter: true, // Twitter/X video extraction
+    enableYouTube: true, // YouTube download routing
+    enabled: true, // Master switch
+    enabledSites: {}, // Per-host overrides: { "example.com": false }
+    hlsConcurrency: 4, // Parallel HLS segment downloads
     logLevel: "info", // 'debug' | 'info' | 'warn' | 'error'
+    maxMSEMemoryMB: 6144, // Hard cap on MSE buffer capture (MB) — 6 GB
+    maxRetries: 2, // Retry count on network failure
+    requestTimeoutBlob: 60000, // Timeout for blob/binary fetches (ms)
+    requestTimeoutText: 15000, // Timeout for text/json fetches (ms)
     rescanIntervalMs: 5000, // Fallback rescan interval
   };
 
-  let settings = Object.assign({}, DEFAULT_SETTINGS);
+  let settings = {
+    ...DEFAULT_SETTINGS,
+    enabledSites: { ...DEFAULT_SETTINGS.enabledSites },
+  };
   try {
     const saved = GM_getValue("omnifetch_settings", null);
-    if (saved) Object.assign(settings, JSON.parse(saved));
-  } catch (e) {
+    if (saved) {
+      const parsed = JSON.parse(saved);
+      settings = {
+        ...settings,
+        ...parsed,
+        enabledSites: {
+          ...settings.enabledSites,
+          ...(parsed.enabledSites || {}),
+        },
+      };
+    }
+  } catch {
     /* use defaults */
   }
 
   function saveSettings() {
     try {
       GM_setValue("omnifetch_settings", JSON.stringify(settings));
-    } catch (e) {}
+    } catch {
+      // Ignore storage errors in restricted userscript contexts.
+    }
   }
 
   function isSiteEnabled() {
-    if (!settings.enabled) return false;
-    if (settings.enabledSites.hasOwnProperty(HOST))
+    if (!settings.enabled) {
+      return false;
+    }
+    if (Object.prototype.hasOwnProperty.call(settings.enabledSites, HOST)) {
       return settings.enabledSites[HOST];
+    }
     return true; // enabled by default unless explicitly disabled
   }
 
@@ -74,7 +96,7 @@
   // SECTION 1: STRUCTURED LOGGER WITH RING BUFFER
   // =========================================================================
 
-  const LOG_LEVELS = { debug: 0, info: 1, warn: 2, error: 3 };
+  const LOG_LEVELS = { debug: 0, error: 3, info: 1, warn: 2 };
   const LOG_RING_SIZE = 200; // Keep last 200 entries for diagnostics
   const logRing = [];
 
@@ -88,7 +110,9 @@
           .join(" "),
       };
       logRing.push(entry);
-      if (logRing.length > LOG_RING_SIZE) logRing.shift();
+      if (logRing.length > LOG_RING_SIZE) {
+        logRing.shift();
+      }
       if (LOG_LEVELS[level] >= LOG_LEVELS[settings.logLevel]) {
         const fn =
           level === "error"
@@ -113,7 +137,7 @@
     },
     exportReport() {
       return [
-        `OmniFetch v24.2 Debug Report — ${new Date().toISOString()}`,
+        `OmniFetch v${SCRIPT_VERSION} Debug Report — ${new Date().toISOString()}`,
         `URL: ${window.location.href}`,
         `UA: ${navigator.userAgent}`,
         `Settings: ${JSON.stringify(settings, null, 2)}`,
@@ -223,7 +247,9 @@
       try {
         const meta = JSON.parse(decodeURIComponent(url.split("/").pop()));
         if (meta.fileName) fileName = meta.fileName;
-      } catch (e) {}
+      } catch {
+        // Keep generated fallback filename.
+      }
       const fetchPart = (writable) => {
         fetch(url, {
           method: "GET",
@@ -243,10 +269,10 @@
               contentRangeRegex,
             );
             if (range) {
-              if (parseInt(range[1]) !== nextOffset)
+              if (parseInt(range[1], 10) !== nextOffset)
                 throw new Error("Gap detected");
-              nextOffset = parseInt(range[2]) + 1;
-              totalSize = parseInt(range[3]);
+              nextOffset = parseInt(range[2], 10) + 1;
+              totalSize = parseInt(range[3], 10);
               updateProgress(
                 videoId,
                 fileName,
@@ -522,7 +548,7 @@
     return;
   }
 
-  Log.info("OmniFetch v24 initializing on", HOST);
+  Log.info(`OmniFetch v${SCRIPT_VERSION} initializing on`, HOST);
 
   // =========================================================================
   // SECTION 2: NETWORKING PRIMITIVES (timeout + retry + abort)
@@ -535,7 +561,9 @@
     for (const handle of activeRequests) {
       try {
         if (typeof handle.abort === "function") handle.abort();
-      } catch (e) {}
+      } catch {
+        // Ignore abort errors from stale/closed handles.
+      }
     }
     activeRequests.clear();
   }
@@ -647,7 +675,7 @@
           // Some TM builds return a plain object with arrayBuffer/text methods
           try {
             blob = new Blob([await blob.arrayBuffer()]);
-          } catch (_) {
+          } catch {
             blob = null;
           }
         }
@@ -701,6 +729,10 @@
     return (b / 1048576).toFixed(1) + " MB";
   }
 
+  function openInNewTab(url) {
+    window.open(url, "_blank", "noopener,noreferrer");
+  }
+
   // Parallel downloader with concurrency limit and abort awareness
   async function downloadParallel(urls, concurrency, onEachDone) {
     const results = new Array(urls.length);
@@ -722,10 +754,13 @@
     }
 
     const workers = [];
-    for (let i = 0; i < Math.min(concurrency, urls.length); i++)
+    for (let i = 0; i < Math.min(concurrency, urls.length); i++) {
       workers.push(worker());
+    }
     await Promise.all(workers);
-    if (firstError) throw firstError;
+    if (firstError) {
+      throw firstError;
+    }
     return results;
   }
 
@@ -857,7 +892,7 @@
         s,
       );
       s.remove();
-    } catch (e) {
+    } catch {
       Log.warn("Script injection blocked (CSP?), trying unsafeWindow fallback");
       try {
         uWindow.eval(code);
@@ -986,7 +1021,9 @@
       for (const f of ["iv.mp4", "ia.mp4", "o.mp4"]) {
         try {
           await ffmpegInstance.deleteFile(f);
-        } catch (e) {}
+        } catch {
+          // Cleanup failures are non-fatal.
+        }
       }
       hideProgressOverlay();
       return result;
@@ -1027,7 +1064,9 @@
       for (const f of [inName, "o.mp4"]) {
         try {
           await ffmpegInstance.deleteFile(f);
-        } catch (e) {}
+        } catch {
+          // Cleanup failures are non-fatal.
+        }
       }
       hideProgressOverlay();
       return result;
@@ -1073,7 +1112,7 @@
         const nextLine = lines[i + 1];
         if (nextLine && !nextLine.startsWith("#")) {
           result.variants.push({
-            bandwidth: bw ? parseInt(bw[1]) : 0,
+            bandwidth: bw ? parseInt(bw[1], 10) : 0,
             resolution: res ? res[1] : "",
             url: new URL(nextLine, baseUrl).href,
             audioGroupId: audio ? audio[1] : null,
@@ -1139,7 +1178,7 @@
           result.segments.push(seg);
           result.totalDuration += currentDuration;
           currentDuration = 0;
-        } catch (e) {
+        } catch {
           /* skip malformed URLs */
         }
       }
@@ -1288,9 +1327,9 @@
       as.querySelectorAll("Representation").forEach((rep) => {
         const entry = {
           id: rep.getAttribute("id") || "",
-          bandwidth: parseInt(rep.getAttribute("bandwidth") || "0"),
-          width: parseInt(rep.getAttribute("width") || "0"),
-          height: parseInt(rep.getAttribute("height") || "0"),
+          bandwidth: parseInt(rep.getAttribute("bandwidth") || "0", 10),
+          width: parseInt(rep.getAttribute("width") || "0", 10),
+          height: parseInt(rep.getAttribute("height") || "0", 10),
           mime: rep.getAttribute("mimeType") || mimeType,
           segments: [], // Array of URLs to download in order
         };
@@ -1311,9 +1350,10 @@
           const init = segTpl.getAttribute("initialization") || "";
           const startNumber = parseInt(
             segTpl.getAttribute("startNumber") || "1",
+            10,
           );
-          const timescale = parseInt(segTpl.getAttribute("timescale") || "1");
-          const duration = parseInt(segTpl.getAttribute("duration") || "0");
+          const timescale = parseInt(segTpl.getAttribute("timescale") || "1", 10);
+          const duration = parseInt(segTpl.getAttribute("duration") || "0", 10);
 
           const repId = entry.id;
           const repBw = entry.bandwidth;
@@ -1324,7 +1364,7 @@
               .replace(/\$Bandwidth\$/g, String(repBw))
               .replace(/\$Number(%\d+d)?\$/g, (_, fmt) =>
                 fmt
-                  ? String(num).padStart(parseInt(fmt.slice(1)), "0")
+                  ? String(num).padStart(parseInt(fmt.slice(1), 10), "0")
                   : String(num),
               )
               .replace(/\$Time\$/g, String(time));
@@ -1344,10 +1384,10 @@
               num = startNumber;
             entries.forEach((s) => {
               const t = s.getAttribute("t")
-                ? parseInt(s.getAttribute("t"))
+                ? parseInt(s.getAttribute("t"), 10)
                 : time;
-              const d = parseInt(s.getAttribute("d") || "0");
-              const r = parseInt(s.getAttribute("r") || "0");
+              const d = parseInt(s.getAttribute("d") || "0", 10);
+              const r = parseInt(s.getAttribute("r") || "0", 10);
               time = t;
               for (let j = 0; j <= r; j++) {
                 segs.push(new URL(fillTemplate(media, num, time), mpdUrl).href);
@@ -1364,8 +1404,8 @@
               const m = pd.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:([\d.]+)S)?/);
               if (m)
                 periodDurSec =
-                  parseInt(m[1] || 0) * 3600 +
-                  parseInt(m[2] || 0) * 60 +
+                  parseInt(m[1] || 0, 10) * 3600 +
+                  parseInt(m[2] || 0, 10) * 60 +
                   parseFloat(m[3] || 0);
             }
             const segDurSec = duration / timescale;
@@ -1870,7 +1910,7 @@
                 <button class="omnifetch-settings-btn" id="of-save-btn">Save &amp; Reload</button>
                 <button class="omnifetch-settings-btn" id="of-debug-btn" style="background:#555">Copy Debug Report</button>
             </div>
-            <p style="color:#666;font-size:10px;margin:8px 0 0">v24.2 · Changes apply after page reload</p>
+            <p style="color:#666;font-size:10px;margin:8px 0 0">v${SCRIPT_VERSION} · Changes apply after page reload</p>
         `;
     document.body.appendChild(panel);
 
@@ -1885,13 +1925,13 @@
       settings.enableNetworkSniff = document.getElementById("of-sniff").checked;
       settings.enableThirdPartyYT = document.getElementById("of-yt3p").checked;
       settings.maxMSEMemoryMB =
-        parseInt(document.getElementById("of-mse-cap").value) || 6144;
+        parseInt(document.getElementById("of-mse-cap").value, 10) || 6144;
       settings.hlsConcurrency =
-        parseInt(document.getElementById("of-hls-conc").value) || 4;
+        parseInt(document.getElementById("of-hls-conc").value, 10) || 4;
       settings.requestTimeoutBlob =
-        (parseInt(document.getElementById("of-timeout").value) || 60) * 1000;
+        (parseInt(document.getElementById("of-timeout").value, 10) || 60) * 1000;
       settings.maxRetries =
-        parseInt(document.getElementById("of-retries").value) || 2;
+        parseInt(document.getElementById("of-retries").value, 10) || 2;
       saveSettings();
       window.location.reload();
     };
@@ -1934,6 +1974,7 @@
     const dlId = startDownload();
     setBtnProgress(btn, "⏳");
     // Pre-open tab synchronously to avoid popup blocker
+    // Keep a window reference for later redirect; cannot use noopener here.
     const tab = window.open("about:blank", "_blank");
     try {
       const fd = new FormData();
@@ -1971,7 +2012,7 @@
       const js2 = JSON.parse(res2.responseText);
       if (js2.c_status === "CONVERTED" && js2.dlink) {
         if (tab) tab.location.href = js2.dlink;
-        else window.open(js2.dlink, "_blank");
+        else openInNewTab(js2.dlink);
       } else {
         if (tab) tab.close();
         alert(
@@ -2054,6 +2095,7 @@
         a.href = url;
         a.download = filename;
         a.target = "_blank";
+        a.rel = "noopener noreferrer";
         document.body.appendChild(a);
         a.click();
         a.remove();
@@ -2132,9 +2174,8 @@
       btn.onclick = (e) => {
         e.preventDefault();
         if (!isIdle()) return;
-        window.open(
+        openInNewTab(
           "https://rapidsave.com/info?url=" + encodeURIComponent(realUrl),
-          "_blank",
         );
       };
     } else if (
@@ -2267,7 +2308,9 @@
         Object.values(p).forEach((pl) => {
           if (pl?.tech_?.el_) handleVideo(pl.tech_.el_);
         });
-      } catch (e) {}
+      } catch {
+        // Ignore framework adapter errors on unsupported pages.
+      }
     }
     // JW Player
     if (uWindow.jwplayer) {
@@ -2277,7 +2320,9 @@
           const v = jw.getContainer().querySelector("video");
           if (v) handleVideo(v);
         }
-      } catch (e) {}
+      } catch {
+        // Ignore framework adapter errors on unsupported pages.
+      }
     }
     // Plyr / Flowplayer
     document
@@ -2290,7 +2335,7 @@
       try {
         const doc = iframe.contentDocument || iframe.contentWindow?.document;
         if (doc) doc.querySelectorAll("video").forEach(handleVideo);
-      } catch (e) {
+      } catch {
         /* cross-origin */
       }
     });
@@ -2332,7 +2377,9 @@
         of.totalVideoBytes = 0;
         of.totalAudioBytes = 0;
       }
-    } catch (e) {}
+    } catch {
+      // Ignore reset errors when page-script state is unavailable.
+    }
 
     const badge = document.getElementById("omnifetch-sniff-badge");
     if (badge) {
