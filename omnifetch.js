@@ -1,22 +1,18 @@
 // ==UserScript==
 // @name         OmniFetch
 // @namespace    http://tampermonkey.net/
-// @version      26.2
+// @version      26.4
 // @description  Universal video downloader with real HLS/DASH support, FFmpeg muxing, MSE interception, network sniffing, and per-site settings. Supports Reddit, Twitter/X, Facebook, Instagram, TikTok, Vimeo, Telegram, and any HTML5 video player.
 // @author       adrikosm
 // @match        *://*/*
 // @grant        GM_download
 // @grant        GM_xmlhttpRequest
-// @grant        GM_addStyle
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        unsafeWindow
 // @run-at       document-start
 // @connect      *
 // ==/UserScript==
-
-/* eslint-env browser */
-/* global GM_download, GM_xmlhttpRequest, GM_addStyle, GM_getValue, GM_setValue, unsafeWindow */
 
 // NOTE: @require for FFmpeg removed — it is now lazy-loaded only when muxing is needed.
 // NOTE: @connect * is required for universal media downloading across CDNs.
@@ -25,8 +21,9 @@
 (function () {
   "use strict";
 
-  const SCRIPT_VERSION = "26.2";
+  const SCRIPT_VERSION = "26.4";
   const HOST = window.location.hostname;
+  const SETTINGS_STORAGE_KEY = "omnifetch_settings";
   const uWindow = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
 
   // =========================================================================
@@ -34,6 +31,7 @@
   // =========================================================================
 
   const DEFAULT_SETTINGS = {
+    autoDownloadMSE: false, // Auto-trigger MSE download when stream completes
     dashConcurrency: 4, // Parallel DASH segment downloads
     enableMSECapture: true, // MSE buffer interception
     enableNetworkSniff: true, // fetch/XHR hook for manifest detection
@@ -48,39 +46,87 @@
     logLevel: "info", // 'debug' | 'info' | 'warn' | 'error'
     maxMSEMemoryMB: 6144, // Hard cap on MSE buffer capture (MB) — 6 GB
     maxRetries: 2, // Retry count on network failure
+    maxSniffedUrls: 200, // Cap sniffed manifests kept in memory
+    removeIframeSandbox: false, // Removes iframe sandbox attributes (risky)
     requestTimeoutBlob: 60000, // Timeout for blob/binary fetches (ms)
     requestTimeoutText: 15000, // Timeout for text/json fetches (ms)
     rescanIntervalMs: 5000, // Fallback rescan interval
+    strictSecurityMode: true, // Blocks risky features by default
   };
 
-  let settings = {
-    ...DEFAULT_SETTINGS,
-    enabledSites: { ...DEFAULT_SETTINGS.enabledSites },
-  };
-  try {
-    const saved = GM_getValue("omnifetch_settings", null);
-    if (saved) {
+  function loadSettings() {
+    const baseSettings = {
+      ...DEFAULT_SETTINGS,
+      enabledSites: { ...DEFAULT_SETTINGS.enabledSites },
+    };
+
+    try {
+      const saved = GM_getValue(SETTINGS_STORAGE_KEY, null);
+      if (!saved) {
+        return baseSettings;
+      }
+
       const parsed = JSON.parse(saved);
-      settings = {
-        ...settings,
+      return {
+        ...baseSettings,
         ...parsed,
         enabledSites: {
-          ...settings.enabledSites,
+          ...baseSettings.enabledSites,
           ...(parsed.enabledSites || {}),
         },
       };
+    } catch {
+      return baseSettings;
     }
-  } catch {
-    /* use defaults */
   }
+
+  let settings = loadSettings();
 
   function saveSettings() {
     try {
-      GM_setValue("omnifetch_settings", JSON.stringify(settings));
+      GM_setValue(SETTINGS_STORAGE_KEY, JSON.stringify(settings));
     } catch {
       // Ignore storage errors in restricted userscript contexts.
     }
   }
+
+  function readIntegerInput(id, fallbackValue, minValue, maxValue) {
+    const input = document.getElementById(id);
+    const parsedValue = parseInt(input?.value || "", 10);
+    const safeValue = Number.isFinite(parsedValue)
+      ? parsedValue
+      : fallbackValue;
+    return Math.max(minValue, Math.min(maxValue, safeValue));
+  }
+
+  function syncLegacyCompatFlags() {
+    // Compatibility with Unlimited_downloader-style runtime flags.
+    uWindow.autoDownload = settings.autoDownloadMSE ? 1 : 0;
+    if (typeof uWindow.downloadAll !== "number") {
+      uWindow.downloadAll = 0;
+    }
+    if (typeof uWindow.quickPlay !== "number") {
+      uWindow.quickPlay = 1.0;
+    }
+  }
+
+  function isStrictSecurityMode() {
+    return settings.strictSecurityMode !== false;
+  }
+
+  function enforceSecurityPolicy() {
+    settings.maxSniffedUrls = Math.max(
+      20,
+      Math.min(2000, parseInt(settings.maxSniffedUrls, 10) || 200),
+    );
+    if (isStrictSecurityMode()) {
+      settings.enableThirdPartyYT = false;
+      settings.removeIframeSandbox = false;
+    }
+  }
+
+  enforceSecurityPolicy();
+  syncLegacyCompatFlags();
 
   function isSiteEnabled() {
     if (!settings.enabled) {
@@ -162,8 +208,9 @@
     const REFRESH_DELAY = 500;
     const hashCode = (s) => {
       let h = 0;
-      for (let i = 0; i < s.length; i++)
+      for (let i = 0; i < s.length; i++) {
         h = ((h << 5) - h + s.charCodeAt(i)) | 0;
+      }
       return h >>> 0;
     };
 
@@ -174,7 +221,9 @@
       const container = document.getElementById(
         "tel-downloader-progress-bar-container",
       );
-      if (!container) return;
+      if (!container) {
+        return;
+      }
       const inner = document.createElement("div");
       inner.id = "tel-downloader-progress-" + videoId;
       inner.style.cssText = `width:20rem;margin-top:0.4rem;padding:0.6rem;background:${isDarkMode ? "rgba(0,0,0,0.3)" : "rgba(0,0,0,0.6)"}`;
@@ -205,7 +254,9 @@
     };
     const updateProgress = (videoId, fileName, pct) => {
       const el = document.getElementById("tel-downloader-progress-" + videoId);
-      if (!el) return;
+      if (!el) {
+        return;
+      }
       el.querySelector("p.filename").textContent = fileName;
       const bar = el.querySelector("div.progress");
       bar.querySelector("p").textContent = pct + "%";
@@ -215,7 +266,9 @@
       const bar = document
         .getElementById("tel-downloader-progress-" + videoId)
         ?.querySelector("div.progress");
-      if (!bar) return;
+      if (!bar) {
+        return;
+      }
       bar.querySelector("p").textContent = "Completed";
       bar.querySelector("div").style.cssText +=
         ";background:#B6C649;width:100%";
@@ -224,7 +277,9 @@
       const bar = document
         .getElementById("tel-downloader-progress-" + videoId)
         ?.querySelector("div.progress");
-      if (!bar) return;
+      if (!bar) {
+        return;
+      }
       bar.querySelector("p").textContent = "Aborted";
       bar.querySelector("div").style.cssText +=
         ";background:#D16666;width:100%";
@@ -246,7 +301,9 @@
       let fileName = hashCode(url).toString(36) + "." + ext;
       try {
         const meta = JSON.parse(decodeURIComponent(url.split("/").pop()));
-        if (meta.fileName) fileName = meta.fileName;
+        if (meta.fileName) {
+          fileName = meta.fileName;
+        }
       } catch {
         // Keep generated fallback filename.
       }
@@ -256,8 +313,9 @@
           headers: { Range: `bytes=${nextOffset}-` },
         })
           .then((res) => {
-            if (![200, 206].includes(res.status))
+            if (![200, 206].includes(res.status)) {
               throw new Error("HTTP " + res.status);
+            }
             const mime = (res.headers.get("Content-Type") || "video/mp4").split(
               ";",
             )[0];
@@ -269,8 +327,9 @@
               contentRangeRegex,
             );
             if (range) {
-              if (parseInt(range[1], 10) !== nextOffset)
+              if (parseInt(range[1], 10) !== nextOffset) {
                 throw new Error("Gap detected");
+              }
               nextOffset = parseInt(range[2], 10) + 1;
               totalSize = parseInt(range[3], 10);
               updateProgress(
@@ -283,10 +342,12 @@
           })
           .then((blob) => (writable ? writable.write(blob) : blobs.push(blob)))
           .then(() => {
-            if (totalSize && nextOffset < totalSize) fetchPart(writable);
-            else {
-              if (writable) writable.close();
-              else {
+            if (totalSize && nextOffset < totalSize) {
+              fetchPart(writable);
+            } else {
+              if (writable) {
+                writable.close();
+              } else {
                 const blobUrl = URL.createObjectURL(
                   new Blob(blobs, { type: "video/mp4" }),
                 );
@@ -371,8 +432,9 @@
               sizeMB +
               " MB captured).\n\nDownload what's available so far?",
           )
-        )
+        ) {
           return;
+        }
       }
 
       const videoId =
@@ -439,7 +501,9 @@
       const actions = document.querySelector(
         "#MediaViewer .MediaViewerActions",
       );
-      if (!actions) return;
+      if (!actions) {
+        return;
+      }
       const vid = document.querySelector(
         "#MediaViewer .MediaViewerContent > .VideoPlayer",
       );
@@ -471,10 +535,14 @@
       const buttons = document.querySelector(
         ".media-viewer-whole .media-viewer-topbar .media-viewer-buttons",
       );
-      if (!aspecter || !buttons) return;
+      if (!aspecter || !buttons) {
+        return;
+      }
       buttons.querySelectorAll("button.btn-icon.hide").forEach((b) => {
         b.classList.remove("hide");
-        if (b.textContent === DOWNLOAD_ICON) b.classList.add("tgico-download");
+        if (b.textContent === DOWNLOAD_ICON) {
+          b.classList.add("tgico-download");
+        }
       });
       if (
         aspecter.querySelector("video") &&
@@ -560,7 +628,9 @@
   function abortAllRequests() {
     for (const handle of activeRequests) {
       try {
-        if (typeof handle.abort === "function") handle.abort();
+        if (typeof handle.abort === "function") {
+          handle.abort();
+        }
       } catch {
         // Ignore abort errors from stale/closed handles.
       }
@@ -576,11 +646,15 @@
           ...opts,
           timeout: opts.timeout || settings.requestTimeoutText,
           onload(r) {
-            if (handle) activeRequests.delete(handle);
+            if (handle) {
+              activeRequests.delete(handle);
+            }
             resolve(r);
           },
           onerror(e) {
-            if (handle) activeRequests.delete(handle);
+            if (handle) {
+              activeRequests.delete(handle);
+            }
             reject(
               new Error(
                 "Network error: " + (e?.statusText || e?.error || "unknown"),
@@ -588,7 +662,9 @@
             );
           },
           ontimeout() {
-            if (handle) activeRequests.delete(handle);
+            if (handle) {
+              activeRequests.delete(handle);
+            }
             reject(
               new Error(
                 "Timeout after " +
@@ -604,27 +680,33 @@
         return reject(new Error("GM_xmlhttpRequest threw: " + e.message));
       }
       // Safari TM may return undefined or a non-abortable handle
-      if (handle && typeof handle.abort === "function")
+      if (handle && typeof handle.abort === "function") {
         activeRequests.add(handle);
+      }
     });
   }
 
   async function fetchText(url, retries) {
+    const safeUrl = ensureHttpUrl(url, "fetchText");
     retries = retries ?? settings.maxRetries;
     for (let attempt = 0; attempt <= retries; attempt++) {
       try {
         const r = await gmRequest({
           method: "GET",
-          url,
+          url: safeUrl,
           headers: { Accept: "*/*" },
           timeout: settings.requestTimeoutText,
         });
-        if (r.status >= 200 && r.status < 400) return r.responseText;
+        if (r.status >= 200 && r.status < 400) {
+          return r.responseText;
+        }
         throw new Error("HTTP " + r.status);
       } catch (e) {
-        if (attempt === retries) throw e;
+        if (attempt === retries) {
+          throw e;
+        }
         Log.debug(
-          `fetchText retry ${attempt + 1}/${retries} for ${url.substring(0, 80)}: ${e.message}`,
+          `fetchText retry ${attempt + 1}/${retries} for ${safeUrl.substring(0, 80)}: ${e.message}`,
         );
         await new Promise((r) => setTimeout(r, 500 * (attempt + 1))); // backoff
       }
@@ -632,31 +714,36 @@
   }
 
   async function fetchJSON(url, headers = {}, method = "GET") {
+    const safeUrl = ensureHttpUrl(url, "fetchJSON");
     const r = await gmRequest({
       method,
-      url,
+      url: safeUrl,
       headers,
       timeout: settings.requestTimeoutText,
     });
     // Handle TM implementation differences: r.response may already be parsed
-    if (typeof r.response === "object" && r.response !== null)
+    if (typeof r.response === "object" && r.response !== null) {
       return r.response;
+    }
     return JSON.parse(r.responseText);
   }
 
   async function fetchBlob(url, onProgress = null, retries) {
+    const safeUrl = ensureHttpUrl(url, "fetchBlob");
     retries = retries ?? settings.maxRetries;
     for (let attempt = 0; attempt <= retries; attempt++) {
       try {
         const r = await gmRequest({
           method: "GET",
-          url,
+          url: safeUrl,
           responseType: "blob",
           headers: { Accept: "*/*", Referer: window.location.href },
           timeout: settings.requestTimeoutBlob,
           onprogress: onProgress
             ? (p) => {
-                if (p.lengthComputable) onProgress(p.loaded, p.total);
+                if (p.lengthComputable) {
+                  onProgress(p.loaded, p.total);
+                }
               }
             : undefined,
         });
@@ -679,7 +766,9 @@
             blob = null;
           }
         }
-        if (blob && blob.size > 0) return blob;
+        if (blob && blob.size > 0) {
+          return blob;
+        }
         // Last resort: if responseType was silently ignored, raw text may exist
         if (r.responseText && r.responseText.length > 0) {
           const enc = new TextEncoder();
@@ -687,7 +776,9 @@
         }
         throw new Error("Empty response");
       } catch (e) {
-        if (attempt === retries) throw e;
+        if (attempt === retries) {
+          throw e;
+        }
         Log.debug(`fetchBlob retry ${attempt + 1}/${retries}: ${e.message}`);
         await new Promise((r) => setTimeout(r, 500 * (attempt + 1)));
       }
@@ -724,13 +815,111 @@
   }
 
   function formatBytes(b) {
-    if (b < 1024) return b + " B";
-    if (b < 1048576) return (b / 1024).toFixed(0) + " KB";
+    if (b < 1024) {
+      return b + " B";
+    }
+    if (b < 1048576) {
+      return (b / 1024).toFixed(0) + " KB";
+    }
     return (b / 1048576).toFixed(1) + " MB";
   }
 
+  function toUrl(rawUrl, base = window.location.href) {
+    if (typeof rawUrl !== "string") {
+      return null;
+    }
+    const trimmed = rawUrl.trim();
+    if (!trimmed) {
+      return null;
+    }
+    try {
+      return new URL(trimmed, base);
+    } catch {
+      return null;
+    }
+  }
+
+  function toHttpUrl(rawUrl, base = window.location.href) {
+    const parsed = toUrl(rawUrl, base);
+    if (!parsed) {
+      return null;
+    }
+    if (parsed.protocol === "http:" || parsed.protocol === "https:") {
+      return parsed;
+    }
+    return null;
+  }
+
+  function isBlobUrl(rawUrl) {
+    return typeof rawUrl === "string" && rawUrl.startsWith("blob:");
+  }
+
+  function ensureHttpUrl(rawUrl, label) {
+    const safe = toHttpUrl(rawUrl);
+    if (!safe) {
+      throw new Error(`${label}: blocked unsafe or invalid URL`);
+    }
+    return safe.href;
+  }
+
+  function normalizeRouteSource(src) {
+    if (typeof src !== "string") {
+      return null;
+    }
+    const trimmed = src.trim();
+    if (!trimmed) {
+      return null;
+    }
+    if (trimmed.startsWith("reddit:") || isBlobUrl(trimmed)) {
+      return trimmed;
+    }
+    const safe = toHttpUrl(trimmed);
+    return safe ? safe.href : null;
+  }
+
+  function isDashManifestUrl(url) {
+    const safe = toHttpUrl(url);
+    if (!safe) {
+      return false;
+    }
+    const target = (safe.pathname + safe.search).toLowerCase();
+    return target.includes(".mpd");
+  }
+
+  function isHlsManifestUrl(url) {
+    const safe = toHttpUrl(url);
+    if (!safe) {
+      return false;
+    }
+    const target = (safe.pathname + safe.search).toLowerCase();
+    return target.includes(".m3u8");
+  }
+
+  function pickPreferredManifestUrl(urls) {
+    return (
+      urls.find((u) => isHlsManifestUrl(u)) ||
+      urls.find((u) => isDashManifestUrl(u)) ||
+      null
+    );
+  }
+
+  function pushUniqueCapped(list, value, limit) {
+    if (!value || list.includes(value)) {
+      return;
+    }
+    list.push(value);
+    if (list.length > limit) {
+      list.splice(0, list.length - limit);
+    }
+  }
+
   function openInNewTab(url) {
-    window.open(url, "_blank", "noopener,noreferrer");
+    const safe = toHttpUrl(url);
+    if (!safe) {
+      Log.warn("Blocked unsafe new-tab URL:", url);
+      return;
+    }
+    window.open(safe.href, "_blank", "noopener,noreferrer");
   }
 
   // Parallel downloader with concurrency limit and abort awareness
@@ -746,9 +935,13 @@
         try {
           results[idx] = await fetchBlob(urls[idx]);
           completed++;
-          if (onEachDone) onEachDone(completed, urls.length);
+          if (onEachDone) {
+            onEachDone(completed, urls.length);
+          }
         } catch (e) {
-          if (!firstError) firstError = e;
+          if (!firstError) {
+            firstError = e;
+          }
         }
       }
     }
@@ -781,11 +974,29 @@
             OF.maxBytes = ${settings.maxMSEMemoryMB * 1024 * 1024};
             OF.captureEnabled = ${settings.enableMSECapture};
             OF.sniffEnabled = ${settings.enableNetworkSniff};
+            OF.autoDownload = ${settings.autoDownloadMSE ? 1 : 0};
+            OF.maxSniffedUrls = ${settings.maxSniffedUrls};
+
+            if (typeof window.autoDownload !== 'number') window.autoDownload = OF.autoDownload;
+            if (typeof window.downloadAll !== 'number') window.downloadAll = 0;
+            if (typeof window.quickPlay !== 'number') window.quickPlay = 1.0;
+            window.isComplete = OF.mseComplete ? 1 : 0;
+            window.audio = OF.audioChunks;
+            window.video = OF.videoChunks;
+
+            function mirrorToString(wrapperFn, originalFn) {
+                try {
+                    Object.defineProperty(wrapperFn, 'toString', {
+                        value: function() { return originalFn.toString(); },
+                        configurable: true
+                    });
+                } catch(e) {}
+            }
 
             // --- MSE Interceptor with memory cap ---
             // Hooks both MediaSource (Chrome/Firefox/old Safari) and
             // ManagedMediaSource (Safari 17+) for full WebKit coverage.
-            function hookMSEProto(MSE, label) {
+            function hookMSEProto(MSE) {
                 if (!MSE || !MSE.prototype || !MSE.prototype.addSourceBuffer) return;
                 try {
                     var _addSB = MSE.prototype.addSourceBuffer;
@@ -793,8 +1004,10 @@
                         var mimeStr = String(mime);
                         var isVideo = mimeStr.includes('video');
                         var isAudio = mimeStr.includes('audio');
-                        if (isVideo) { OF.videoChunks = []; OF.videoMime = mimeStr; OF.totalVideoBytes = 0; }
-                        if (isAudio) { OF.audioChunks = []; OF.audioMime = mimeStr; OF.totalAudioBytes = 0; }
+                        if (isVideo) { OF.videoChunks = []; OF.videoMime = mimeStr; OF.totalVideoBytes = 0; window.video = OF.videoChunks; }
+                        if (isAudio) { OF.audioChunks = []; OF.audioMime = mimeStr; OF.totalAudioBytes = 0; window.audio = OF.audioChunks; }
+                        window.downloadAll = 0;
+                        window.isComplete = 0;
                         var sb = _addSB.call(this, mime);
                         if (sb && sb.appendBuffer) {
                             var _append = sb.appendBuffer;
@@ -814,32 +1027,47 @@
                                 } catch(e) {}
                                 return _append.call(this, buffer);
                             };
+                            mirrorToString(sb.appendBuffer, _append);
                         }
                         return sb;
                     };
+                    mirrorToString(MSE.prototype.addSourceBuffer, _addSB);
                     var _eos = MSE.prototype.endOfStream;
                     MSE.prototype.endOfStream = function() {
                         OF.mseComplete = true;
+                        window.isComplete = 1;
                         try { window.dispatchEvent(new CustomEvent('omnifetch-mse-complete')); } catch(e) {}
+                        if (window.autoDownload === 1) {
+                            try { window.dispatchEvent(new CustomEvent('omnifetch-auto-download-request')); } catch(e) {}
+                        }
                         return _eos.apply(this, arguments);
                     };
+                    mirrorToString(MSE.prototype.endOfStream, _eos);
                 } catch(e) { /* prototype frozen or inaccessible */ }
             }
             if (OF.captureEnabled) {
-                hookMSEProto(window.MediaSource, 'MediaSource');
-                hookMSEProto(window.ManagedMediaSource, 'ManagedMediaSource'); // Safari 17+
-                hookMSEProto(window.WebKitMediaSource, 'WebKitMediaSource');   // Legacy Safari
+                hookMSEProto(window.MediaSource);
+                hookMSEProto(window.ManagedMediaSource); // Safari 17+
+                hookMSEProto(window.WebKitMediaSource);   // Legacy Safari
             }
 
             // --- Network Sniffer ---
             if (OF.sniffEnabled) {
                 var pushUrl = function(url) {
                     if (typeof url !== 'string') return;
-                    if (url.includes('.m3u8') || url.includes('.mpd')) {
-                        if (OF.sniffedUrls.indexOf(url) === -1) {
-                            OF.sniffedUrls.push(url);
-                            try { window.dispatchEvent(new CustomEvent('omnifetch-url-sniffed', { detail: { url: url } })); } catch(e) {}
+                    try {
+                        var u = new URL(url, window.location.href);
+                        if (u.protocol !== 'http:' && u.protocol !== 'https:') return;
+                        var target = (u.pathname + u.search).toLowerCase();
+                        if (!target.includes('.m3u8') && !target.includes('.mpd')) return;
+                        var normalized = u.href;
+                        if (OF.sniffedUrls.indexOf(normalized) === -1) {
+                            OF.sniffedUrls.push(normalized);
+                            if (OF.sniffedUrls.length > OF.maxSniffedUrls) OF.sniffedUrls.shift();
+                            try { window.dispatchEvent(new CustomEvent('omnifetch-url-sniffed', { detail: { url: normalized } })); } catch(e) {}
                         }
+                    } catch(e) {
+                        /* ignore malformed URLs */
                     }
                 };
                 if (window.fetch) {
@@ -914,7 +1142,9 @@
   let ffmpegReady = false;
 
   async function loadFFmpeg() {
-    if (ffmpegReady) return true;
+    if (ffmpegReady) {
+      return true;
+    }
     if (ffmpegLoading) {
       return new Promise((resolve) => {
         const check = setInterval(() => {
@@ -985,7 +1215,9 @@
   }
 
   async function muxVideoAudio(videoBlob, audioBlob) {
-    if (!(await loadFFmpeg()) || !ffmpegInstance) return null;
+    if (!(await loadFFmpeg()) || !ffmpegInstance) {
+      return null;
+    }
     try {
       showProgressOverlay("Muxing audio + video...");
       const vData = new Uint8Array(await videoBlob.arrayBuffer());
@@ -1035,7 +1267,9 @@
   }
 
   async function remuxToMP4(inputBlob, inputExt = "ts") {
-    if (!(await loadFFmpeg()) || !ffmpegInstance) return null;
+    if (!(await loadFFmpeg()) || !ffmpegInstance) {
+      return null;
+    }
     try {
       showProgressOverlay("Remuxing to MP4...");
       const data = new Uint8Array(await inputBlob.arrayBuffer());
@@ -1098,7 +1332,6 @@
 
     let currentDuration = 0;
     let currentByteRange = null;
-    let currentByteOffset = 0;
 
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i];
@@ -1157,7 +1390,9 @@
       // Segment duration
       if (line.startsWith("#EXTINF")) {
         const dur = parseFloat(line.split(":")[1]);
-        if (!isNaN(dur)) currentDuration = dur;
+        if (!isNaN(dur)) {
+          currentDuration = dur;
+        }
       }
 
       // Byte range
@@ -1206,8 +1441,9 @@
       const sorted = master.variants
         .slice()
         .sort((a, b) => b.bandwidth - a.bandwidth);
-      if (sorted.length === 0)
+      if (sorted.length === 0) {
         throw new Error("No variants found in master playlist");
+      }
       videoPlaylistUrl = sorted[0].url;
       Log.info(
         `HLS: picked variant ${sorted[0].resolution || "best"} (${sorted[0].bandwidth} bps)`,
@@ -1218,7 +1454,9 @@
         const audioRend = master.audioRenditions.find(
           (r) => r.groupId === sorted[0].audioGroupId,
         );
-        if (audioRend) audioPlaylistUrl = audioRend.url;
+        if (audioRend) {
+          audioPlaylistUrl = audioRend.url;
+        }
       }
     }
 
@@ -1229,7 +1467,9 @@
       dlId,
       "V",
     );
-    if (isStale(dlId) || !videoBlob) return;
+    if (isStale(dlId) || !videoBlob) {
+      return;
+    }
 
     let finalBlob = videoBlob;
     let alreadyMuxed = false;
@@ -1244,7 +1484,9 @@
         dlId,
         "A",
       );
-      if (isStale(dlId)) return;
+      if (isStale(dlId)) {
+        return;
+      }
       if (audioBlob) {
         const muxed = await muxVideoAudio(videoBlob, audioBlob);
         if (muxed) {
@@ -1267,7 +1509,9 @@
       setBtnProgress(btn, "Remux...");
       const ext = videoBlob.type === "video/mp4" ? "mp4" : "ts";
       const remuxed = await remuxToMP4(finalBlob, ext);
-      if (remuxed) finalBlob = remuxed;
+      if (remuxed) {
+        finalBlob = remuxed;
+      }
     }
 
     if (!isStale(dlId)) {
@@ -1280,9 +1524,12 @@
     const text = await fetchText(playlistUrl);
     const playlist = parseM3U8(text, playlistUrl);
 
-    if (playlist.isEncrypted) throw new Error("Encrypted HLS stream");
-    if (playlist.segments.length === 0)
+    if (playlist.isEncrypted) {
+      throw new Error("Encrypted HLS stream");
+    }
+    if (playlist.segments.length === 0) {
       throw new Error("No segments in playlist");
+    }
 
     const urls = [];
     // fMP4: init segment must come first
@@ -1299,11 +1546,15 @@
       urls,
       settings.hlsConcurrency,
       (done, total) => {
-        if (!isStale(dlId)) setBtnProgress(btn, `${label} ${done}/${total}`);
+        if (!isStale(dlId)) {
+          setBtnProgress(btn, `${label} ${done}/${total}`);
+        }
       },
     );
 
-    if (isStale(dlId)) return null;
+    if (isStale(dlId)) {
+      return null;
+    }
 
     const type = playlist.isFMP4 ? "video/mp4" : "video/mp2t";
     return new Blob(blobs, { type });
@@ -1352,7 +1603,10 @@
             segTpl.getAttribute("startNumber") || "1",
             10,
           );
-          const timescale = parseInt(segTpl.getAttribute("timescale") || "1", 10);
+          const timescale = parseInt(
+            segTpl.getAttribute("timescale") || "1",
+            10,
+          );
           const duration = parseInt(segTpl.getAttribute("duration") || "0", 10);
 
           const repId = entry.id;
@@ -1373,8 +1627,9 @@
           const segs = [];
 
           // Init segment
-          if (init)
+          if (init) {
             segs.push(new URL(fillTemplate(init, startNumber, 0), mpdUrl).href);
+          }
 
           // Check for SegmentTimeline
           const timeline = segTpl.querySelector("SegmentTimeline");
@@ -1402,11 +1657,12 @@
             if (periodEl?.getAttribute("duration")) {
               const pd = periodEl.getAttribute("duration");
               const m = pd.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:([\d.]+)S)?/);
-              if (m)
+              if (m) {
                 periodDurSec =
                   parseInt(m[1] || 0, 10) * 3600 +
                   parseInt(m[2] || 0, 10) * 60 +
                   parseFloat(m[3] || 0);
+              }
             }
             const segDurSec = duration / timescale;
             const segCount = Math.ceil(periodDurSec / segDurSec);
@@ -1415,7 +1671,9 @@
             }
           }
 
-          if (segs.length > 0) entry.segments = segs;
+          if (segs.length > 0) {
+            entry.segments = segs;
+          }
         }
 
         // --- Strategy 3: SegmentList ---
@@ -1430,9 +1688,13 @@
           segList.querySelectorAll("SegmentURL").forEach((su) => {
             const mediaUrl =
               su.getAttribute("media") || su.getAttribute("mediaURL");
-            if (mediaUrl) segs.push(new URL(mediaUrl, mpdUrl).href);
+            if (mediaUrl) {
+              segs.push(new URL(mediaUrl, mpdUrl).href);
+            }
           });
-          if (segs.length > 0) entry.segments = segs;
+          if (segs.length > 0) {
+            entry.segments = segs;
+          }
         }
 
         if (entry.segments.length > 0) {
@@ -1456,11 +1718,14 @@
   async function downloadDASH(mpdUrl, btn, dlId) {
     Log.info("DASH download:", mpdUrl);
     const xmlText = await fetchText(mpdUrl);
-    if (isStale(dlId)) return;
+    if (isStale(dlId)) {
+      return;
+    }
 
     const mpd = parseMPD(xmlText, mpdUrl);
-    if (mpd.video.length === 0)
+    if (mpd.video.length === 0) {
       throw new Error("No video representations found in MPD");
+    }
 
     const bestVideo = mpd.video[0];
     const bestAudio = mpd.audio.length > 0 ? mpd.audio[0] : null;
@@ -1475,8 +1740,9 @@
     if (bestVideo.segments.length === 1) {
       // Single file — direct download
       const blob = await fetchBlob(bestVideo.segments[0], (loaded, total) => {
-        if (!isStale(dlId) && total)
+        if (!isStale(dlId) && total) {
           setBtnProgress(btn, "V " + Math.round((loaded / total) * 100) + "%");
+        }
       });
       videoBlobs = [blob];
     } else {
@@ -1484,11 +1750,15 @@
         bestVideo.segments,
         settings.dashConcurrency,
         (done, total) => {
-          if (!isStale(dlId)) setBtnProgress(btn, `V ${done}/${total}`);
+          if (!isStale(dlId)) {
+            setBtnProgress(btn, `V ${done}/${total}`);
+          }
         },
       );
     }
-    if (isStale(dlId)) return;
+    if (isStale(dlId)) {
+      return;
+    }
     const videoBlob = new Blob(videoBlobs, { type: "video/mp4" });
 
     // Download audio segments
@@ -1503,11 +1773,15 @@
           bestAudio.segments,
           settings.dashConcurrency,
           (done, total) => {
-            if (!isStale(dlId)) setBtnProgress(btn, `A ${done}/${total}`);
+            if (!isStale(dlId)) {
+              setBtnProgress(btn, `A ${done}/${total}`);
+            }
           },
         );
       }
-      if (isStale(dlId)) return;
+      if (isStale(dlId)) {
+        return;
+      }
       const audioBlob = new Blob(audioBlobs, { type: "audio/mp4" });
 
       // Mux
@@ -1544,19 +1818,25 @@
 
   const ReactUtils = {
     getFiber(el) {
-      if (!el) return null;
-      for (const p of Object.keys(el))
+      if (!el) {
+        return null;
+      }
+      for (const p of Object.keys(el)) {
         if (
           p.startsWith("__reactFiber") ||
           p.startsWith("__reactInternalInstance")
-        )
+        ) {
           return el[p];
+        }
+      }
       return null;
     },
     returnUntil(fiber, pred) {
       let f = fiber;
       while (f) {
-        if (pred(f)) return f;
+        if (pred(f)) {
+          return f;
+        }
         f = f.return;
       }
       return null;
@@ -1578,7 +1858,9 @@
           const impl = t.memoizedProps.implementations.find((x) =>
             x.typename?.includes("VideoPlayer"),
           );
-          if (impl) return impl.data.hdSrc || impl.data.sdSrc;
+          if (impl) {
+            return impl.data.hdSrc || impl.data.sdSrc;
+          }
         }
       }
       // Twitter / X
@@ -1586,7 +1868,9 @@
         (HOST.includes("twitter.com") || HOST.includes("x.com")) &&
         settings.enableTwitter
       ) {
-        if (video.dataset.twResolvedUrl) return video.dataset.twResolvedUrl;
+        if (video.dataset.twResolvedUrl) {
+          return video.dataset.twResolvedUrl;
+        }
         const f = ReactUtils.getFiber(video.parentElement?.parentElement);
         const t = ReactUtils.returnUntil(
           f,
@@ -1625,9 +1909,11 @@
       if (HOST.includes("reddit.com") && settings.enableReddit) {
         const post = video.closest("shreddit-post") || video.closest(".thing");
         let permalink = window.location.pathname;
-        if (post?.getAttribute("permalink"))
+        if (post?.getAttribute("permalink")) {
           permalink = post.getAttribute("permalink");
-        else if (post?.dataset?.permalink) permalink = post.dataset.permalink;
+        } else if (post?.dataset?.permalink) {
+          permalink = post.dataset.permalink;
+        }
         return "reddit:" + window.location.origin + permalink;
       }
       // Instagram
@@ -1639,7 +1925,9 @@
           f,
           (f) => f.memoizedProps?.videoUrl || f.memoizedProps?.src,
         );
-        if (t) return t.memoizedProps.videoUrl || t.memoizedProps.src;
+        if (t) {
+          return t.memoizedProps.videoUrl || t.memoizedProps.src;
+        }
       }
       // TikTok
       if (HOST.includes("tiktok.com")) {
@@ -1652,11 +1940,12 @@
             f.memoizedProps?.videoData?.downloadAddr ||
             f.memoizedProps?.videoData?.playAddr,
         );
-        if (t)
+        if (t) {
           return (
             t.memoizedProps.videoData.downloadAddr ||
             t.memoizedProps.videoData.playAddr
           );
+        }
       }
       // Vimeo
       if (HOST.includes("vimeo.com")) {
@@ -1667,7 +1956,9 @@
               const progs = JSON.parse(m[1]).sort(
                 (a, b) => (b.width || 0) - (a.width || 0),
               );
-              if (progs[0]?.url) return progs[0].url;
+              if (progs[0]?.url) {
+                return progs[0].url;
+              }
             }
           }
         }
@@ -1681,7 +1972,9 @@
         "data-mpd-url",
         "data-stream-url",
       ]) {
-        if (video.getAttribute(attr)) return video.getAttribute(attr);
+        if (video.getAttribute(attr)) {
+          return video.getAttribute(attr);
+        }
       }
       // Framework players
       const playerContainer = video.closest(
@@ -1692,15 +1985,13 @@
           playerContainer.getAttribute("data-video-src") ||
           playerContainer.getAttribute("data-hls-url") ||
           playerContainer.getAttribute("data-dash-url");
-        if (src) return src;
+        if (src) {
+          return src;
+        }
       }
       // Sniffed manifests (prefer m3u8 over mpd)
       if (sniffedManifestUrls.length > 0) {
-        return (
-          sniffedManifestUrls.find((u) => u.includes(".m3u8")) ||
-          sniffedManifestUrls.find((u) => u.includes(".mpd")) ||
-          null
-        );
+        return pickPreferredManifestUrl(sniffedManifestUrls);
       }
     } catch (e) {
       Log.warn("Extractor exception:", e.message);
@@ -1724,11 +2015,104 @@
   let buttonContainer = null;
   let isDirectVideoTab = false;
   let currentDownloadId = 0;
+  let lastAutoMSESignature = "";
   let sniffedManifestUrls = [];
+
+  function isAutoDownloadEnabled() {
+    return settings.autoDownloadMSE || uWindow.autoDownload === 1;
+  }
+
+  function getMSECaptureSignature(of) {
+    const vCount = (of.videoChunks || []).length;
+    const aCount = (of.audioChunks || []).length;
+    return [
+      of.totalVideoBytes || 0,
+      of.totalAudioBytes || 0,
+      vCount,
+      aCount,
+      of.videoMime || "",
+      of.audioMime || "",
+    ].join("|");
+  }
+
+  function sanitizeFilenameSegment(name) {
+    return (name || "media")
+      .replace(/[\\/:*?"<>|]/g, "_")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 120);
+  }
+
+  function triggerLegacyTrackDump() {
+    const of = uWindow.__omnifetch || {};
+    const vChunks = of.videoChunks || [];
+    const aChunks = of.audioChunks || [];
+    const titleSafe = sanitizeFilenameSegment(document.title);
+
+    if (aChunks.length > 0) {
+      const audioBlob = new Blob(aChunks, {
+        type: of.audioMime || "audio/mp4",
+      });
+      triggerBlobDownload(audioBlob, `audio_${titleSafe}.mp4`);
+    }
+    if (vChunks.length > 0) {
+      const videoBlob = new Blob(vChunks, {
+        type: of.videoMime || "video/mp4",
+      });
+      triggerBlobDownload(videoBlob, `video_${titleSafe}.mp4`);
+    }
+    uWindow.downloadAll = 0;
+  }
+
+  function maybeAutoDownloadMSE(trigger = "event") {
+    if (!isAutoDownloadEnabled() || !isIdle()) {
+      return;
+    }
+    if (!activeVideoSrc || !activeVideoSrc.startsWith("blob:")) {
+      return;
+    }
+
+    const of = uWindow.__omnifetch || {};
+    const hasVideo = (of.videoChunks || []).length > 0;
+    if (!of.mseComplete || !hasVideo) {
+      return;
+    }
+
+    const signature = getMSECaptureSignature(of);
+    if (signature === lastAutoMSESignature) {
+      return;
+    }
+    lastAutoMSESignature = signature;
+
+    const btn = document.getElementById("omnifetch-dl-btn");
+    if (!btn) {
+      return;
+    }
+
+    Log.info(`Auto-download requested (${trigger}).`);
+    triggerMSEDownload(btn).catch((e) =>
+      Log.warn("Auto-download failed:", e.message),
+    );
+  }
+
+  function stripIframeSandboxAttributes() {
+    if (isStrictSecurityMode() || !settings.removeIframeSandbox) {
+      return;
+    }
+    document.querySelectorAll("iframe[sandbox]").forEach((iframe) => {
+      try {
+        iframe.removeAttribute("sandbox");
+      } catch (e) {
+        Log.debug("Sandbox strip skipped:", e.message);
+      }
+    });
+  }
 
   function startDownload() {
     // Cancel any previous in-flight download
-    if (currentDownloadId !== 0) abortAllRequests();
+    if (currentDownloadId !== 0) {
+      abortAllRequests();
+    }
     currentDownloadId = Date.now() + Math.random();
     return currentDownloadId;
   }
@@ -1736,28 +2120,46 @@
     return currentDownloadId !== dlId;
   }
   function finishDownload(dlId) {
-    if (currentDownloadId === dlId) currentDownloadId = 0;
+    if (currentDownloadId === dlId) {
+      currentDownloadId = 0;
+    }
   }
   function isIdle() {
     return currentDownloadId === 0;
   }
 
   function cancelCurrentDownload() {
-    if (currentDownloadId === 0) return;
+    if (currentDownloadId === 0) {
+      return;
+    }
     Log.info("Download cancelled by user");
     abortAllRequests();
     currentDownloadId = 0;
     hideProgressOverlay();
     const btn = document.getElementById("omnifetch-dl-btn");
-    if (btn) resetBtn(btn);
+    if (btn) {
+      resetBtn(btn);
+    }
   }
 
   window.addEventListener("omnifetch-url-sniffed", (e) => {
-    if (e.detail?.url && !sniffedManifestUrls.includes(e.detail.url)) {
-      sniffedManifestUrls.push(e.detail.url);
-      Log.debug("Sniffed manifest:", e.detail.url);
+    const url = e.detail?.url;
+    if (isHlsManifestUrl(url) || isDashManifestUrl(url)) {
+      const safe = toHttpUrl(url);
+      if (safe) {
+        pushUniqueCapped(
+          sniffedManifestUrls,
+          safe.href,
+          settings.maxSniffedUrls,
+        );
+        Log.debug("Sniffed manifest:", safe.href);
+      }
     }
   });
+
+  window.addEventListener("omnifetch-auto-download-request", () =>
+    maybeAutoDownloadMSE("page-hook"),
+  );
 
   // =========================================================================
   // SECTION 9: UI (button, progress overlay, settings panel)
@@ -1771,21 +2173,29 @@
   const svgCancel = `<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#FF3B30" stroke-width="3" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>`;
 
   function setBtnProgress(btn, text) {
-    if (!btn) return;
+    if (!btn) {
+      return;
+    }
     btn.innerHTML = `<span style="font-size:11px;font-weight:700;color:#007AFF;font-family:system-ui;white-space:nowrap">${text}</span>`;
     btn.style.cursor = "wait";
     // Show cancel button
     const cancelBtn = document.getElementById("omnifetch-cancel-btn");
-    if (cancelBtn) cancelBtn.style.display = "flex";
+    if (cancelBtn) {
+      cancelBtn.style.display = "flex";
+    }
   }
 
   function resetBtn(btn) {
-    if (!btn) return;
+    if (!btn) {
+      return;
+    }
     btn.innerHTML = svgDownload;
     btn.style.backgroundColor = "rgba(255,255,255,0.9)";
     btn.style.cursor = "pointer";
     const cancelBtn = document.getElementById("omnifetch-cancel-btn");
-    if (cancelBtn) cancelBtn.style.display = "none";
+    if (cancelBtn) {
+      cancelBtn.style.display = "none";
+    }
   }
 
   function showProgressOverlay(msg) {
@@ -1803,12 +2213,15 @@
 
   function hideProgressOverlay() {
     const ov = document.getElementById("omnifetch-mux-overlay");
-    if (ov) ov.style.display = "none";
+    if (ov) {
+      ov.style.display = "none";
+    }
   }
 
   function createUI() {
-    if (document.getElementById("omnifetch-container"))
+    if (document.getElementById("omnifetch-container")) {
       return document.getElementById("omnifetch-dl-btn");
+    }
     const style = document.createElement("style");
     style.textContent = `
             @keyframes omnifetch-outline-pulse{0%,100%{outline-color:rgba(0,122,255,0.4)}50%{outline-color:rgba(0,122,255,0.85)}}
@@ -1883,7 +2296,9 @@
   }
 
   function createSettingsPanel() {
-    if (document.getElementById("omnifetch-settings-panel")) return;
+    if (document.getElementById("omnifetch-settings-panel")) {
+      return;
+    }
     const panel = document.createElement("div");
     panel.id = "omnifetch-settings-panel";
     panel.innerHTML = `
@@ -1897,12 +2312,16 @@
             <label>Reddit <input type="checkbox" id="of-rd" ${settings.enableReddit ? "checked" : ""}></label>
             <hr>
             <div style="font-size:12px;font-weight:600;color:#8888aa;margin-bottom:4px">Engine</div>
+            <label>Strict security mode <input type="checkbox" id="of-strict" ${isStrictSecurityMode() ? "checked" : ""}></label>
             <label>MSE buffer capture <input type="checkbox" id="of-mse" ${settings.enableMSECapture ? "checked" : ""}></label>
             <label>Network sniffing <input type="checkbox" id="of-sniff" ${settings.enableNetworkSniff ? "checked" : ""}></label>
+            <label>Auto-download completed MSE <input type="checkbox" id="of-auto-mse" ${settings.autoDownloadMSE ? "checked" : ""}></label>
+            <label>Remove iframe sandbox (risky) <input type="checkbox" id="of-strip-sandbox" ${settings.removeIframeSandbox ? "checked" : ""}></label>
             <label>YouTube 3rd-party converter <input type="checkbox" id="of-yt3p" ${settings.enableThirdPartyYT ? "checked" : ""}></label>
             <hr>
             <label>MSE memory cap (MB) <input type="number" id="of-mse-cap" value="${settings.maxMSEMemoryMB}" min="64" max="8192"></label>
             <label>HLS concurrency <input type="number" id="of-hls-conc" value="${settings.hlsConcurrency}" min="1" max="8"></label>
+            <label>Sniffed URL cap <input type="number" id="of-sniff-cap" value="${settings.maxSniffedUrls}" min="20" max="2000"></label>
             <label>Request timeout (s) <input type="number" id="of-timeout" value="${settings.requestTimeoutBlob / 1000}" min="5" max="300"></label>
             <label>Max retries <input type="number" id="of-retries" value="${settings.maxRetries}" min="0" max="5"></label>
             <hr>
@@ -1915,24 +2334,31 @@
     document.body.appendChild(panel);
 
     document.getElementById("of-save-btn").onclick = () => {
-      const siteCheck = document.getElementById("of-site-enabled").checked;
-      settings.enabledSites[HOST] = siteCheck;
+      const isStrictModeEnabled = document.getElementById("of-strict").checked;
+      settings.enabledSites[HOST] =
+        document.getElementById("of-site-enabled").checked;
       settings.enableTelegram = document.getElementById("of-tg").checked;
       settings.enableYouTube = document.getElementById("of-yt").checked;
       settings.enableTwitter = document.getElementById("of-tw").checked;
       settings.enableReddit = document.getElementById("of-rd").checked;
+      settings.strictSecurityMode = isStrictModeEnabled;
       settings.enableMSECapture = document.getElementById("of-mse").checked;
       settings.enableNetworkSniff = document.getElementById("of-sniff").checked;
-      settings.enableThirdPartyYT = document.getElementById("of-yt3p").checked;
-      settings.maxMSEMemoryMB =
-        parseInt(document.getElementById("of-mse-cap").value, 10) || 6144;
-      settings.hlsConcurrency =
-        parseInt(document.getElementById("of-hls-conc").value, 10) || 4;
+      settings.autoDownloadMSE = document.getElementById("of-auto-mse").checked;
+      settings.removeIframeSandbox =
+        !isStrictModeEnabled &&
+        document.getElementById("of-strip-sandbox").checked;
+      settings.enableThirdPartyYT =
+        !isStrictModeEnabled && document.getElementById("of-yt3p").checked;
+      settings.maxMSEMemoryMB = readIntegerInput("of-mse-cap", 6144, 64, 8192);
+      settings.hlsConcurrency = readIntegerInput("of-hls-conc", 4, 1, 8);
+      settings.maxSniffedUrls = readIntegerInput("of-sniff-cap", 200, 20, 2000);
       settings.requestTimeoutBlob =
-        (parseInt(document.getElementById("of-timeout").value, 10) || 60) * 1000;
-      settings.maxRetries =
-        parseInt(document.getElementById("of-retries").value, 10) || 2;
+        readIntegerInput("of-timeout", 60, 5, 300) * 1000;
+      settings.maxRetries = readIntegerInput("of-retries", 2, 0, 5);
+      enforceSecurityPolicy();
       saveSettings();
+      syncLegacyCompatFlags();
       window.location.reload();
     };
 
@@ -1956,8 +2382,9 @@
 
   function toggleSettingsPanel() {
     const panel = document.getElementById("omnifetch-settings-panel");
-    if (panel)
+    if (panel) {
       panel.style.display = panel.style.display === "none" ? "block" : "none";
+    }
   }
 
   // =========================================================================
@@ -1965,6 +2392,12 @@
   // =========================================================================
 
   async function triggerYT3PDownload(url, btn) {
+    if (isStrictSecurityMode()) {
+      alert(
+        "Strict security mode is enabled.\n\nDisable Strict security mode in OmniFetch settings to allow 3rd-party YouTube conversion.",
+      );
+      return;
+    }
     if (!settings.enableThirdPartyYT) {
       alert(
         "YouTube 3rd-party downloading is disabled.\n\nEnable it in OmniFetch settings (gear icon) if you accept the privacy/reliability risks of using external conversion services.",
@@ -1987,7 +2420,9 @@
         timeout: 20000,
       });
       if (isStale(dlId)) {
-        if (tab) tab.close();
+        if (tab) {
+          tab.close();
+        }
         return;
       }
       const js = JSON.parse(resp.responseText);
@@ -1996,7 +2431,9 @@
       const k = js.links?.mp4?.auto
         ? js.links.mp4.auto.k
         : Object.values(js.links?.mp4 || {})[0]?.k;
-      if (!k) throw new Error("No conversion key found");
+      if (!k) {
+        throw new Error("No conversion key found");
+      }
       fd2.set("k", k);
       btn.innerHTML = svgSettings;
       const res2 = await gmRequest({
@@ -2006,24 +2443,37 @@
         timeout: 60000,
       });
       if (isStale(dlId)) {
-        if (tab) tab.close();
+        if (tab) {
+          tab.close();
+        }
         return;
       }
       const js2 = JSON.parse(res2.responseText);
       if (js2.c_status === "CONVERTED" && js2.dlink) {
-        if (tab) tab.location.href = js2.dlink;
-        else openInNewTab(js2.dlink);
+        if (tab) {
+          tab.location.href = js2.dlink;
+        } else {
+          openInNewTab(js2.dlink);
+        }
       } else {
-        if (tab) tab.close();
+        if (tab) {
+          tab.close();
+        }
         alert(
           "YouTube conversion failed. Try a different video or disable 3rd-party in settings.",
         );
       }
     } catch (e) {
-      if (tab) tab.close();
-      if (!isStale(dlId)) Log.error("YT3P download:", e.message);
+      if (tab) {
+        tab.close();
+      }
+      if (!isStale(dlId)) {
+        Log.error("YT3P download:", e.message);
+      }
     } finally {
-      if (!isStale(dlId)) resetBtn(btn);
+      if (!isStale(dlId)) {
+        resetBtn(btn);
+      }
       finishDownload(dlId);
     }
   }
@@ -2039,7 +2489,9 @@
         alert("DASH download failed: " + e.message);
       }
     } finally {
-      if (!isStale(dlId)) resetBtn(btn);
+      if (!isStale(dlId)) {
+        resetBtn(btn);
+      }
       finishDownload(dlId);
     }
   }
@@ -2055,23 +2507,39 @@
         alert("HLS download failed: " + e.message);
       }
     } finally {
-      if (!isStale(dlId)) resetBtn(btn);
+      if (!isStale(dlId)) {
+        resetBtn(btn);
+      }
       finishDownload(dlId);
     }
   }
 
   async function triggerNativeDownload(url, btn) {
+    const safeUrl = toHttpUrl(url);
+    if (!safeUrl) {
+      Log.warn("Blocked unsafe native download URL:", url);
+      alert("Blocked unsafe download URL.");
+      return;
+    }
+
     const dlId = startDownload();
     setBtnProgress(btn, "⏳");
     const filename = (() => {
-      const path = url.split("?")[0].split("/").pop();
-      return path.match(/\.[a-zA-Z0-9]{2,5}$/) ? path : "video_download.mp4";
+      const path = safeUrl.pathname.split("/").pop() || "";
+      let decoded = path;
+      try {
+        decoded = decodeURIComponent(path || "");
+      } catch {
+        decoded = path;
+      }
+      const clean = sanitizeFilenameSegment(decoded);
+      return clean.match(/\.[a-zA-Z0-9]{2,5}$/) ? clean : "video_download.mp4";
     })();
     try {
       if (typeof GM_download === "function") {
         await new Promise((resolve, reject) => {
           GM_download({
-            url,
+            url: safeUrl.href,
             name: filename,
             saveAs: true,
             headers: { Referer: window.location.href },
@@ -2082,17 +2550,20 @@
           });
         });
       } else {
-        const blob = await fetchBlob(url, (loaded, total) => {
-          if (!isStale(dlId) && total)
+        const blob = await fetchBlob(safeUrl.href, (loaded, total) => {
+          if (!isStale(dlId) && total) {
             setBtnProgress(btn, Math.round((loaded / total) * 100) + "%");
+          }
         });
-        if (!isStale(dlId)) triggerBlobDownload(blob, filename);
+        if (!isStale(dlId)) {
+          triggerBlobDownload(blob, filename);
+        }
       }
     } catch (e) {
       Log.warn("Native download fallback:", e.message);
       if (!isStale(dlId)) {
         const a = document.createElement("a");
-        a.href = url;
+        a.href = safeUrl.href;
         a.download = filename;
         a.target = "_blank";
         a.rel = "noopener noreferrer";
@@ -2101,7 +2572,9 @@
         a.remove();
       }
     } finally {
-      if (!isStale(dlId)) resetBtn(btn);
+      if (!isStale(dlId)) {
+        resetBtn(btn);
+      }
       finishDownload(dlId);
     }
   }
@@ -2125,9 +2598,12 @@
         const audioBlob = new Blob(aChunks, { type: "audio/mp4" });
         btn.innerHTML = svgMux;
         const muxed = await muxVideoAudio(videoBlob, audioBlob);
-        if (isStale(dlId)) return;
-        if (muxed) triggerBlobDownload(muxed, "video_download.mp4");
-        else {
+        if (isStale(dlId)) {
+          return;
+        }
+        if (muxed) {
+          triggerBlobDownload(muxed, "video_download.mp4");
+        } else {
           triggerBlobDownload(videoBlob, "video_track.mp4");
           setTimeout(
             () => triggerBlobDownload(audioBlob, "audio_track.m4a"),
@@ -2143,7 +2619,9 @@
         alert("MSE download failed: " + e.message);
       }
     } finally {
-      if (!isStale(dlId)) resetBtn(btn);
+      if (!isStale(dlId)) {
+        resetBtn(btn);
+      }
       finishDownload(dlId);
     }
   }
@@ -2154,8 +2632,11 @@
 
   function updateDownloadLink(src) {
     let btn = document.getElementById("omnifetch-dl-btn");
-    if (!btn) btn = createUI();
+    if (!btn) {
+      btn = createUI();
+    }
     const badge = document.getElementById("omnifetch-sniff-badge");
+    const routedSrc = normalizeRouteSource(src);
 
     if (badge && sniffedManifestUrls.length > 0) {
       badge.textContent = sniffedManifestUrls.length;
@@ -2168,12 +2649,19 @@
       return;
     }
 
-    if (src.startsWith("reddit:") && settings.enableReddit) {
+    if (!routedSrc) {
+      buttonContainer.style.display = "none";
+      return;
+    }
+
+    if (routedSrc.startsWith("reddit:") && settings.enableReddit) {
       resetBtn(btn);
-      const realUrl = src.split("reddit:")[1];
+      const realUrl = routedSrc.split("reddit:")[1];
       btn.onclick = (e) => {
         e.preventDefault();
-        if (!isIdle()) return;
+        if (!isIdle()) {
+          return;
+        }
         openInNewTab(
           "https://rapidsave.com/info?url=" + encodeURIComponent(realUrl),
         );
@@ -2181,30 +2669,36 @@
     } else if (
       HOST.includes("youtube.com") &&
       settings.enableYouTube &&
-      !src.startsWith("blob:")
+      !isBlobUrl(routedSrc)
     ) {
       resetBtn(btn);
       btn.onclick = (e) => {
         e.preventDefault();
-        if (!isIdle()) return;
+        if (!isIdle()) {
+          return;
+        }
         triggerYT3PDownload(window.location.href, btn);
       };
-    } else if (src.includes(".mpd")) {
+    } else if (isDashManifestUrl(routedSrc)) {
       btn.innerHTML = svgSettings;
       btn.style.cursor = "pointer";
       btn.onclick = (e) => {
         e.preventDefault();
-        if (!isIdle()) return;
-        triggerDASHDownload(src, btn);
+        if (!isIdle()) {
+          return;
+        }
+        triggerDASHDownload(routedSrc, btn);
       };
-    } else if (src.includes(".m3u8")) {
+    } else if (isHlsManifestUrl(routedSrc)) {
       resetBtn(btn);
       btn.onclick = (e) => {
         e.preventDefault();
-        if (!isIdle()) return;
-        triggerHLSDownload(src, btn);
+        if (!isIdle()) {
+          return;
+        }
+        triggerHLSDownload(routedSrc, btn);
       };
-    } else if (src.startsWith("blob:")) {
+    } else if (isBlobUrl(routedSrc)) {
       const of = uWindow.__omnifetch || {};
       if (of.mseComplete) {
         const hasAudio = (of.audioChunks || []).length > 0;
@@ -2217,7 +2711,9 @@
         btn.style.cursor = "pointer";
         btn.onclick = (e) => {
           e.preventDefault();
-          if (!isIdle()) return;
+          if (!isIdle()) {
+            return;
+          }
           triggerMSEDownload(btn);
         };
       } else {
@@ -2235,15 +2731,20 @@
       resetBtn(btn);
       btn.onclick = (e) => {
         e.preventDefault();
-        if (!isIdle()) return;
-        triggerNativeDownload(src, btn);
+        if (!isIdle()) {
+          return;
+        }
+        triggerNativeDownload(routedSrc, btn);
       };
     }
     buttonContainer.style.display = "flex";
   }
 
   window.addEventListener("omnifetch-mse-complete", () => {
-    if (activeVideoSrc) updateDownloadLink(activeVideoSrc);
+    if (activeVideoSrc) {
+      updateDownloadLink(activeVideoSrc);
+    }
+    maybeAutoDownloadMSE("mse-complete");
   });
 
   // =========================================================================
@@ -2256,20 +2757,30 @@
       const inner =
         video.querySelector("video") ||
         video.shadowRoot?.querySelector("video");
-      if (inner) video = inner;
-      else return;
+      if (inner) {
+        video = inner;
+      } else {
+        return;
+      }
     }
-    if (!video || video.tagName !== "VIDEO") return;
-    if (video.dataset.omnifetchHandled) return;
+    if (!video || video.tagName !== "VIDEO") {
+      return;
+    }
+    if (video.dataset.omnifetchHandled) {
+      return;
+    }
     video.dataset.omnifetchHandled = "true";
 
     const onPlaying = async () => {
       const src = await extractDirectVideoSrc(video);
-      if (!src) return;
+      if (!src) {
+        return;
+      }
       activeVideoSrc = src;
       if (!isDirectVideoTab) {
-        if (activeVideoElement && activeVideoElement !== video)
+        if (activeVideoElement && activeVideoElement !== video) {
           activeVideoElement.classList.remove("omnifetch-active-video");
+        }
         activeVideoElement = video;
         video.classList.add("omnifetch-active-video");
       }
@@ -2306,7 +2817,9 @@
       try {
         const p = uWindow.videojs.getPlayers();
         Object.values(p).forEach((pl) => {
-          if (pl?.tech_?.el_) handleVideo(pl.tech_.el_);
+          if (pl?.tech_?.el_) {
+            handleVideo(pl.tech_.el_);
+          }
         });
       } catch {
         // Ignore framework adapter errors on unsupported pages.
@@ -2318,7 +2831,9 @@
         const jw = uWindow.jwplayer();
         if (jw?.getContainer) {
           const v = jw.getContainer().querySelector("video");
-          if (v) handleVideo(v);
+          if (v) {
+            handleVideo(v);
+          }
         }
       } catch {
         // Ignore framework adapter errors on unsupported pages.
@@ -2334,7 +2849,9 @@
     document.querySelectorAll("iframe").forEach((iframe) => {
       try {
         const doc = iframe.contentDocument || iframe.contentWindow?.document;
-        if (doc) doc.querySelectorAll("video").forEach(handleVideo);
+        if (doc) {
+          doc.querySelectorAll("video").forEach(handleVideo);
+        }
       } catch {
         /* cross-origin */
       }
@@ -2351,8 +2868,9 @@
 
   function resetState() {
     Log.info("Navigation reset");
-    if (activeVideoElement)
+    if (activeVideoElement) {
       activeVideoElement.classList.remove("omnifetch-active-video");
+    }
     activeVideoSrc = null;
     activeVideoElement = null;
     isDirectVideoTab = false;
@@ -2364,6 +2882,7 @@
     }
 
     sniffedManifestUrls = [];
+    lastAutoMSESignature = "";
 
     try {
       const of = uWindow.__omnifetch;
@@ -2376,6 +2895,10 @@
         of.sniffedUrls = [];
         of.totalVideoBytes = 0;
         of.totalAudioBytes = 0;
+        uWindow.video = of.videoChunks;
+        uWindow.audio = of.audioChunks;
+        uWindow.isComplete = 0;
+        uWindow.downloadAll = 0;
       }
     } catch {
       // Ignore reset errors when page-script state is unavailable.
@@ -2386,11 +2909,14 @@
       badge.textContent = "0";
       badge.style.display = "none";
     }
-    if (buttonContainer) buttonContainer.style.display = "none";
+    if (buttonContainer) {
+      buttonContainer.style.display = "none";
+    }
     hideProgressOverlay();
   }
 
   function rescanPage() {
+    stripIframeSandboxAttributes();
     createUI();
     if (document.contentType?.startsWith("video/")) {
       isDirectVideoTab = true;
@@ -2403,13 +2929,17 @@
       .forEach((v) => delete v.dataset.omnifetchHandled);
     document.querySelectorAll("video, shreddit-player").forEach(handleVideo);
     scanForFrameworkPlayers();
-    if (activeVideoSrc) updateDownloadLink(activeVideoSrc);
+    if (activeVideoSrc) {
+      updateDownloadLink(activeVideoSrc);
+    }
   }
 
   function onNavigationDetected(newUrl) {
     const oldBase = lastKnownUrl.split("#")[0];
     const newBase = newUrl.split("#")[0];
-    if (oldBase === newBase) return;
+    if (oldBase === newBase) {
+      return;
+    }
     lastKnownUrl = newUrl;
     resetState();
     setTimeout(rescanPage, 600);
@@ -2435,12 +2965,23 @@
     rescanPage();
 
     // MutationObserver — targeted, only fires handleVideo for new video elements
-    if (mutationObserver) mutationObserver.disconnect();
+    if (mutationObserver) {
+      mutationObserver.disconnect();
+    }
     mutationObserver = new MutationObserver((mutations) => {
       let hasNewVideos = false;
       for (const mut of mutations) {
         for (const node of mut.addedNodes) {
-          if (node.nodeType !== Node.ELEMENT_NODE) continue;
+          if (node.nodeType !== Node.ELEMENT_NODE) {
+            continue;
+          }
+          if (
+            settings.removeIframeSandbox &&
+            (node.tagName === "IFRAME" ||
+              node.querySelector?.("iframe[sandbox]"))
+          ) {
+            stripIframeSandboxAttributes();
+          }
           if (node.tagName === "VIDEO" || node.tagName === "SHREDDIT-PLAYER") {
             handleVideo(node);
             hasNewVideos = true;
@@ -2454,15 +2995,27 @@
         }
       }
       // Only scan frameworks if we found new DOM content with videos
-      if (hasNewVideos) scanForFrameworkPlayers();
+      if (hasNewVideos) {
+        scanForFrameworkPlayers();
+      }
     });
     // Safari safety: document.body may rarely be null even after DOMContentLoaded
     const observeTarget = document.body || document.documentElement;
     mutationObserver.observe(observeTarget, { childList: true, subtree: true });
 
     // Periodic fallback (reduced frequency, exponential backoff idea: fixed interval is simpler for userscript)
-    if (rescanInterval) clearInterval(rescanInterval);
+    if (rescanInterval) {
+      clearInterval(rescanInterval);
+    }
     rescanInterval = setInterval(() => {
+      if (settings.removeIframeSandbox) {
+        stripIframeSandboxAttributes();
+      }
+
+      if (uWindow.downloadAll === 1) {
+        triggerLegacyTrackDump();
+      }
+
       // URL polling fallback for SPAs that bypass history hooks
       if (window.location.href !== lastKnownUrl) {
         onNavigationDetected(window.location.href);
@@ -2474,22 +3027,26 @@
         .forEach(handleVideo);
       // Check sniffed URLs when no video element is active
       if (!activeVideoSrc && sniffedManifestUrls.length > 0) {
-        const url =
-          sniffedManifestUrls.find((u) => u.includes(".m3u8")) ||
-          sniffedManifestUrls.find((u) => u.includes(".mpd"));
+        const url = pickPreferredManifestUrl(sniffedManifestUrls);
         if (url) {
           activeVideoSrc = url;
           updateDownloadLink(url);
         }
       }
+
+      maybeAutoDownloadMSE("interval");
     }, settings.rescanIntervalMs);
   }
 
   // Cleanup on page unload
   window.addEventListener("beforeunload", () => {
     abortAllRequests();
-    if (mutationObserver) mutationObserver.disconnect();
-    if (rescanInterval) clearInterval(rescanInterval);
+    if (mutationObserver) {
+      mutationObserver.disconnect();
+    }
+    if (rescanInterval) {
+      clearInterval(rescanInterval);
+    }
   });
 
   // Start (skip main engine on Telegram — it has its own UI)
