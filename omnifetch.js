@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OmniFetch
 // @namespace    http://tampermonkey.net/
-// @version      26.6
+// @version      27.1
 // @description  Universal video downloader with real HLS/DASH support, FFmpeg muxing, MSE interception, network sniffing, and per-site settings. Supports Reddit, Twitter/X, Facebook, Instagram, TikTok, Vimeo, Telegram, and any HTML5 video player.
 // @author       adrikosm
 // @match        *://*/*
@@ -21,10 +21,196 @@
 (function () {
   "use strict";
 
-  const SCRIPT_VERSION = "26.6";
+  const SCRIPT_VERSION = "27.1";
   const HOST = window.location.hostname;
   const SETTINGS_STORAGE_KEY = "omnifetch_settings";
   const uWindow = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
+  const DEFAULT_MSE_MEMORY_MB = 1024;
+  const MIN_MSE_MEMORY_MB = 128;
+  const HARD_MAX_MSE_MEMORY_MB = 2048;
+  const MAX_IN_MEMORY_DOWNLOAD_BYTES = 512 * 1024 * 1024;
+  const MAX_MSE_SPOOL_PENDING_BYTES = 64 * 1024 * 1024;
+  const MAX_FFMPEG_INPUT_BYTES = 768 * 1024 * 1024;
+  const LARGE_SEGMENT_COUNT_THRESHOLD = 400;
+  const DIRECT_CHUNK_SIZE_BYTES = 8 * 1024 * 1024;
+  const TARGET_LARGE_DOWNLOAD_BYTES = 10 * 1024 * 1024 * 1024;
+  const BLOB_URL_REVOKE_DELAY_MS = 15 * 60 * 1000;
+  const MSE_SPOOL_WORKER_SOURCE = String.raw`
+    const state = {
+      root: null,
+      tracks: new Map(),
+    };
+
+    function sanitizeId(value) {
+      return String(value || "track").replace(/[^a-zA-Z0-9._-]/g, "_");
+    }
+
+    function buildTrackName(sessionId, kind) {
+      return "omnifetch_" + sanitizeId(sessionId) + "__" + sanitizeId(kind) + ".bin";
+    }
+
+    async function ensureRoot() {
+      if (!self.navigator || !self.navigator.storage || typeof self.navigator.storage.getDirectory !== "function") {
+        throw new Error("OPFS unavailable");
+      }
+      if (!state.root) {
+        state.root = await self.navigator.storage.getDirectory();
+      }
+      return state.root;
+    }
+
+    async function ensureTrack(sessionId, kind) {
+      const key = sessionId + "::" + kind;
+      let track = state.tracks.get(key);
+      if (!track) {
+        track = {
+          fileHandle: null,
+          key,
+          kind,
+          offset: 0,
+          sessionId,
+          syncHandle: null,
+        };
+        state.tracks.set(key, track);
+      }
+
+      const root = await ensureRoot();
+      if (!track.fileHandle) {
+        track.fileHandle = await root.getFileHandle(buildTrackName(sessionId, kind), {
+          create: true,
+        });
+      }
+      if (!track.syncHandle) {
+        track.syncHandle = await track.fileHandle.createSyncAccessHandle();
+        track.offset = track.syncHandle.getSize();
+      }
+      return track;
+    }
+
+    async function closeTrack(track) {
+      if (!track || !track.syncHandle) {
+        return;
+      }
+      try {
+        track.syncHandle.flush();
+      } catch {}
+      try {
+        track.syncHandle.close();
+      } catch {}
+      track.syncHandle = null;
+    }
+
+    async function resetTrack(sessionId, kind) {
+      const track = await ensureTrack(sessionId, kind);
+      track.syncHandle.truncate(0);
+      track.syncHandle.flush();
+      track.offset = 0;
+      return { size: 0 };
+    }
+
+    async function appendTrack(sessionId, kind, buffer) {
+      const track = await ensureTrack(sessionId, kind);
+      const bytes = new Uint8Array(buffer);
+      let written = 0;
+      while (written < bytes.byteLength) {
+        written += track.syncHandle.write(bytes.subarray(written), {
+          at: track.offset + written,
+        });
+      }
+      track.offset += written;
+      if (track.offset % (8 * 1024 * 1024) < written) {
+        track.syncHandle.flush();
+      }
+      return { bytes: written, size: track.offset };
+    }
+
+    async function snapshotTrack(sessionId, kind) {
+      const track = await ensureTrack(sessionId, kind);
+      await closeTrack(track);
+      const file = await track.fileHandle.getFile();
+      return {
+        file,
+        size: file.size,
+      };
+    }
+
+    async function deleteTrack(sessionId, kind) {
+      const key = sessionId + "::" + kind;
+      const track = state.tracks.get(key);
+      if (track) {
+        await closeTrack(track);
+        state.tracks.delete(key);
+      }
+
+      try {
+        const root = await ensureRoot();
+        await root.removeEntry(buildTrackName(sessionId, kind));
+      } catch {}
+
+      return true;
+    }
+
+    async function releaseSession(sessionId) {
+      await deleteTrack(sessionId, "video");
+      await deleteTrack(sessionId, "audio");
+      return true;
+    }
+
+    async function ping() {
+      const root = await ensureRoot();
+      const probeHandle = await root.getFileHandle("__omnifetch_probe__", {
+        create: true,
+      });
+      const syncHandle = await probeHandle.createSyncAccessHandle();
+      syncHandle.truncate(0);
+      syncHandle.flush();
+      syncHandle.close();
+      try {
+        await root.removeEntry("__omnifetch_probe__");
+      } catch {}
+      return { ok: true };
+    }
+
+    self.onmessage = async (event) => {
+      const message = event.data || {};
+      const id = message.id;
+      const payload = message.payload || {};
+
+      try {
+        let result = null;
+        switch (message.type) {
+          case "appendTrack":
+            result = await appendTrack(payload.sessionId, payload.kind, payload.buffer);
+            break;
+          case "ping":
+            result = await ping();
+            break;
+          case "releaseSession":
+            result = await releaseSession(payload.sessionId);
+            break;
+          case "resetTrack":
+            result = await resetTrack(payload.sessionId, payload.kind);
+            break;
+          case "snapshotTrack":
+            result = await snapshotTrack(payload.sessionId, payload.kind);
+            break;
+          default:
+            throw new Error("Unknown spool worker message: " + message.type);
+        }
+        self.postMessage({
+          id,
+          ok: true,
+          result,
+        });
+      } catch (error) {
+        self.postMessage({
+          error: error && error.message ? error.message : String(error),
+          id,
+          ok: false,
+        });
+      }
+    };
+  `;
 
   // =========================================================================
   // SECTION 0: SETTINGS & CONFIGURATION
@@ -35,7 +221,8 @@
     dashConcurrency: 4, // Parallel DASH segment downloads
     enableMSECapture: true, // MSE buffer interception
     enableNetworkSniff: true, // fetch/XHR hook for manifest detection
-    enableReddit: true, // Reddit → RapidSave routing
+    enableReddit: true, // Reddit extraction / routing
+    enableThirdPartyReddit: false, // Reddit via RapidSave (opt-in)
     enableTelegram: true, // Telegram download module
     enableThirdPartyYT: false, // YouTube via external converter (opt-in)
     enableTwitter: true, // Twitter/X video extraction
@@ -44,7 +231,7 @@
     enabledSites: {}, // Per-host overrides: { "example.com": false }
     hlsConcurrency: 4, // Parallel HLS segment downloads
     logLevel: "info", // 'debug' | 'info' | 'warn' | 'error'
-    maxMSEMemoryMB: 6144, // Hard cap on MSE buffer capture (MB) — 6 GB
+    maxMSEMemoryMB: DEFAULT_MSE_MEMORY_MB, // Hard cap on MSE buffer capture (MB)
     maxRetries: 2, // Retry count on network failure
     maxSniffedUrls: 200, // Cap sniffed manifests kept in memory
     removeIframeSandbox: false, // Removes iframe sandbox attributes (risky)
@@ -100,7 +287,7 @@
   }
 
   function syncLegacyCompatFlags() {
-    // Compatibility with Unlimited_downloader-style runtime flags.
+    // Compatibility flags are mirrored out for inspection only.
     uWindow.autoDownload = settings.autoDownloadMSE ? 1 : 0;
     if (typeof uWindow.downloadAll !== "number") {
       uWindow.downloadAll = 0;
@@ -115,11 +302,39 @@
   }
 
   function enforceSecurityPolicy() {
+    settings.maxMSEMemoryMB = Math.max(
+      MIN_MSE_MEMORY_MB,
+      Math.min(
+        HARD_MAX_MSE_MEMORY_MB,
+        parseInt(settings.maxMSEMemoryMB, 10) || DEFAULT_MSE_MEMORY_MB,
+      ),
+    );
+    settings.hlsConcurrency = Math.max(
+      1,
+      Math.min(8, parseInt(settings.hlsConcurrency, 10) || 4),
+    );
+    settings.dashConcurrency = Math.max(
+      1,
+      Math.min(8, parseInt(settings.dashConcurrency, 10) || 4),
+    );
+    settings.maxRetries = Math.max(
+      0,
+      Math.min(5, parseInt(settings.maxRetries, 10) || 2),
+    );
+    settings.requestTimeoutBlob = Math.max(
+      5000,
+      Math.min(300000, parseInt(settings.requestTimeoutBlob, 10) || 60000),
+    );
+    settings.requestTimeoutText = Math.max(
+      5000,
+      Math.min(300000, parseInt(settings.requestTimeoutText, 10) || 15000),
+    );
     settings.maxSniffedUrls = Math.max(
       20,
       Math.min(2000, parseInt(settings.maxSniffedUrls, 10) || 200),
     );
     if (isStrictSecurityMode()) {
+      settings.enableThirdPartyReddit = false;
       settings.enableThirdPartyYT = false;
       settings.removeIframeSandbox = false;
     }
@@ -136,6 +351,46 @@
       return settings.enabledSites[HOST];
     }
     return true; // enabled by default unless explicitly disabled
+  }
+
+  function redactHttpUrl(rawUrl) {
+    const safe = toHttpUrl(rawUrl);
+    if (!safe) {
+      return String(rawUrl || "");
+    }
+    const hasQuery = safe.search.length > 0;
+    const hasHash = safe.hash.length > 0;
+    return (
+      `${safe.origin}${safe.pathname}` +
+      (hasQuery ? "?[redacted]" : "") +
+      (hasHash ? "#[redacted]" : "")
+    );
+  }
+
+  function redactUrlForReport(rawUrl) {
+    if (typeof rawUrl !== "string" || !rawUrl.trim()) {
+      return String(rawUrl || "");
+    }
+
+    const trimmed = rawUrl.trim();
+    if (trimmed.startsWith("reddit:")) {
+      return `reddit:${redactUrlForReport(trimmed.slice("reddit:".length))}`;
+    }
+    if (trimmed.startsWith("sniff:")) {
+      return `sniff:${redactUrlForReport(trimmed.slice("sniff:".length))}`;
+    }
+    if (trimmed.startsWith("blob:")) {
+      return "blob:[redacted]";
+    }
+    return redactHttpUrl(trimmed);
+  }
+
+  function redactSensitiveText(text) {
+    return String(text || "")
+      .replace(/reddit:[^\s"'`<>]+/g, (match) => redactUrlForReport(match))
+      .replace(/sniff:[^\s"'`<>]+/g, (match) => redactUrlForReport(match))
+      .replace(/blob:[^\s"'`<>]+/g, (match) => redactUrlForReport(match))
+      .replace(/https?:\/\/[^\s"'`<>]+/g, (match) => redactUrlForReport(match));
   }
 
   // =========================================================================
@@ -184,14 +439,18 @@
     exportReport() {
       return [
         `OmniFetch v${SCRIPT_VERSION} Debug Report — ${new Date().toISOString()}`,
-        `URL: ${window.location.href}`,
+        `URL: ${redactUrlForReport(window.location.href)}`,
         `UA: ${navigator.userAgent}`,
         `Settings: ${JSON.stringify(settings, null, 2)}`,
-        `Active source: ${activeVideoSrc || "none"}`,
-        `Sniffed URLs: ${JSON.stringify(sniffedManifestUrls)}`,
-        `MSE state: video=${uWindow.__omnifetch?.videoChunks?.length || 0} chunks, audio=${uWindow.__omnifetch?.audioChunks?.length || 0} chunks, complete=${uWindow.__omnifetch?.mseComplete}`,
+        `Active source: ${redactUrlForReport(activeVideoSrc || "none")}`,
+        `Sniffed URLs: ${JSON.stringify(
+          sniffedManifestUrls.map((url) => redactUrlForReport(url)),
+        )}`,
+        `MSE state: video=${getMSETrackChunkCount(uWindow.__omnifetch, "video")} chunks (${formatBytes(getMSETrackByteCount(uWindow.__omnifetch, "video"))}, ${getMSETrackStorageMode(uWindow.__omnifetch, "video")}), audio=${getMSETrackChunkCount(uWindow.__omnifetch, "audio")} chunks (${formatBytes(getMSETrackByteCount(uWindow.__omnifetch, "audio"))}, ${getMSETrackStorageMode(uWindow.__omnifetch, "audio")}), complete=${uWindow.__omnifetch?.mseComplete}`,
         `------- LOG (last ${logRing.length} entries) -------`,
-        ...logRing.map((e) => `[${e.ts}][${e.level}] ${e.msg}`),
+        ...logRing.map(
+          (e) => `[${e.ts}][${e.level}] ${redactSensitiveText(e.msg)}`,
+        ),
       ].join("\n");
     },
   };
@@ -307,6 +566,7 @@
         totalSize = null,
         ext = "mp4",
         mimeType = "video/mp4";
+      let bufferedBytes = 0;
       const videoId =
         Math.random().toString(36).slice(2, 10) + "_" + Date.now();
       let fileName = hashCode(url).toString(36) + "." + ext;
@@ -344,6 +604,11 @@
               }
               nextOffset = parseInt(range[2], 10) + 1;
               totalSize = parseInt(range[3], 10);
+              if (!writable && totalSize > MAX_IN_MEMORY_DOWNLOAD_BYTES) {
+                throw new Error(
+                  `Telegram direct download is ${formatBytes(totalSize)}, which exceeds OmniFetch's safe in-memory limit on browsers without disk streaming.`,
+                );
+              }
               updateProgress(
                 videoId,
                 fileName,
@@ -352,7 +617,19 @@
             }
             return res.blob();
           })
-          .then((blob) => (writable ? writable.write(blob) : blobs.push(blob)))
+          .then((blob) => {
+            if (writable) {
+              return writable.write(blob);
+            }
+            bufferedBytes += blob.size;
+            if (bufferedBytes > MAX_IN_MEMORY_DOWNLOAD_BYTES) {
+              throw new Error(
+                `Telegram direct download exceeded OmniFetch's safe in-memory limit (${formatBytes(MAX_IN_MEMORY_DOWNLOAD_BYTES)}).`,
+              );
+            }
+            blobs.push(blob);
+            return null;
+          })
           .then(() => {
             if (totalSize && nextOffset < totalSize) {
               fetchPart(writable);
@@ -424,10 +701,10 @@
         return;
       }
 
-      const vChunks = of.videoChunks || [];
-      const aChunks = of.audioChunks || [];
+      const hasVideo = hasMSETrackData(of, "video");
+      const hasAudio = hasMSETrackData(of, "audio");
 
-      if (vChunks.length === 0 && aChunks.length === 0) {
+      if (!hasVideo && !hasAudio) {
         alert(
           "No video data captured yet.\n\nPlease let the video play to the end, then click download again.",
         );
@@ -466,17 +743,39 @@
       updateProgress(videoId, outputFileName, 50);
 
       try {
-        if (aChunks.length > 0 && vChunks.length > 0) {
+        let didDownload = false;
+        if (hasAudio && hasVideo) {
           // Separate audio + video SourceBuffers — need to mux with FFmpeg
           // muxVideoAudio() is a function declaration (hoisted) and all its dependencies
           // are initialized by click-time because we no longer return early.
           updateProgress(videoId, outputFileName, 60);
-          const videoBlob = createMediaBlob(vChunks, of.videoMime, "video/mp4");
-          const audioBlob = createMediaBlob(aChunks, of.audioMime, "audio/mp4");
-          const muxed = await muxVideoAudio(videoBlob, audioBlob, muxPlan);
+          const videoBlob = await getMSETrackBlob(
+            of,
+            "video",
+            sourceUrl,
+            "video/mp4",
+          );
+          const audioBlob = await getMSETrackBlob(
+            of,
+            "audio",
+            sourceUrl,
+            "audio/mp4",
+          );
+          let muxed = null;
+          try {
+            ensureMuxFitsMemory(
+              of.totalVideoBytes,
+              of.totalAudioBytes,
+              "Telegram MSE capture",
+            );
+            muxed = await muxVideoAudio(videoBlob, audioBlob, muxPlan);
+          } catch (muxGuardError) {
+            Log.warn(muxGuardError.message);
+          }
           updateProgress(videoId, outputFileName, 90);
           if (muxed) {
             triggerBlobDownload(muxed, outputFileName);
+            didDownload = true;
           } else {
             Log.warn("Telegram mux failed, downloading tracks separately");
             triggerBlobDownload(
@@ -499,23 +798,29 @@
                 ),
               500,
             );
+            didDownload = true;
           }
         } else {
           // Single muxed track (typical: Telegram feeds interleaved MP4 to one SourceBuffer)
-          const chunks = vChunks.length > 0 ? vChunks : aChunks;
-          const blob = createMediaBlob(
-            chunks,
-            vChunks.length > 0 ? of.videoMime : of.audioMime,
-            vChunks.length > 0 ? "video/mp4" : "audio/mp4",
+          const dominantKind = hasVideo ? "video" : "audio";
+          const blob = await getMSETrackBlob(
+            of,
+            dominantKind,
+            sourceUrl,
+            dominantKind === "video" ? "video/mp4" : "audio/mp4",
           );
           triggerBlobDownload(
             blob,
             buildMediaFilename(
               baseName,
               blob.type,
-              vChunks.length > 0 ? "mp4" : "m4a",
+              dominantKind === "video" ? "mp4" : "m4a",
             ),
           );
+          didDownload = true;
+        }
+        if (didDownload) {
+          releaseActiveMSECapture(sourceUrl);
         }
         if (of.captureLimitReached) {
           partialProgress(videoId);
@@ -846,6 +1151,259 @@
     }
   }
 
+  function getResponseHeader(responseHeaders, headerName) {
+    const match = String(responseHeaders || "").match(
+      new RegExp(`^${headerName}:\\s*(.+)$`, "im"),
+    );
+    return match ? match[1].trim() : "";
+  }
+
+  async function probeRemoteResource(url) {
+    const safeUrl = ensureHttpUrl(url, "probeRemoteResource");
+    try {
+      const response = await gmRequest({
+        method: "HEAD",
+        url: safeUrl,
+        headers: { Accept: "*/*" },
+        timeout: settings.requestTimeoutText,
+      });
+      const length = parseInt(
+        getResponseHeader(response.responseHeaders, "content-length"),
+        10,
+      );
+      return {
+        acceptRanges: /(^|\n)accept-ranges:\s*bytes/i.test(
+          String(response.responseHeaders || ""),
+        ),
+        length: Number.isFinite(length) ? length : null,
+        mime:
+          getResponseHeader(response.responseHeaders, "content-type") ||
+          "application/octet-stream",
+      };
+    } catch {
+      return { acceptRanges: false, length: null, mime: "" };
+    }
+  }
+
+  async function fetchBlobRange(url, start, end) {
+    const safeUrl = ensureHttpUrl(url, "fetchBlobRange");
+    const response = await gmRequest({
+      method: "GET",
+      url: safeUrl,
+      responseType: "blob",
+      headers: {
+        Accept: "*/*",
+        Range: `bytes=${start}-${end}`,
+      },
+      timeout: settings.requestTimeoutBlob,
+    });
+    let blob = response.response;
+    if (blob instanceof ArrayBuffer) {
+      blob = new Blob([blob]);
+    } else if (ArrayBuffer.isView(blob)) {
+      blob = new Blob([blob.buffer.slice(blob.byteOffset, blob.byteOffset + blob.byteLength)]);
+    } else if (blob && typeof blob === "object" && !(blob instanceof Blob)) {
+      blob = new Blob([await blob.arrayBuffer()]);
+    }
+    if (!(blob instanceof Blob) || blob.size <= 0) {
+      throw new Error("Range request returned no data");
+    }
+    return blob;
+  }
+
+  function canUseFileSystemAccess() {
+    try {
+      return (
+        typeof uWindow.showSaveFilePicker === "function" &&
+        uWindow.self === uWindow.top
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  async function openWritableSaveTarget(suggestedName, mimeType) {
+    if (!canUseFileSystemAccess()) {
+      return null;
+    }
+    const cleanName = sanitizeFilenameSegment(suggestedName || "download.bin");
+    const extMatch = cleanName.match(/(\.[a-z0-9]{1,8})$/i);
+    const extension = extMatch ? extMatch[1] : ".bin";
+    const handle = await uWindow.showSaveFilePicker({
+      suggestedName: cleanName,
+      types: [
+        {
+          accept: {
+            [mimeType || "application/octet-stream"]: [extension],
+          },
+          description: "Media file",
+        },
+      ],
+    });
+    return handle.createWritable();
+  }
+
+  async function withSaveTarget(suggestedName, mimeType, writerFn) {
+    const writable = await openWritableSaveTarget(suggestedName, mimeType);
+    if (!writable) {
+      return false;
+    }
+    let closed = false;
+    try {
+      const result = await writerFn(writable);
+      await writable.close();
+      closed = true;
+      return result;
+    } catch (e) {
+      if (!closed && typeof writable.abort === "function") {
+        try {
+          await writable.abort();
+        } catch {
+          // Ignore abort failures after a write error.
+        }
+      }
+      throw e;
+    }
+  }
+
+  async function writeSequentialUrlsToFile(
+    urls,
+    suggestedName,
+    mimeType,
+    btn,
+    dlId,
+    label,
+  ) {
+    if (!urls.length) {
+      throw new Error(`${label}: no segments to write`);
+    }
+    return withSaveTarget(suggestedName, mimeType, async (writable) => {
+      let totalWritten = 0;
+      for (let i = 0; i < urls.length; i++) {
+        if (isStale(dlId)) {
+          throw new Error("Download cancelled");
+        }
+        const blob = await fetchBlob(urls[i]);
+        totalWritten += blob.size;
+        await writable.write(blob);
+        if (!isStale(dlId)) {
+          setBtnProgress(
+            btn,
+            `${label} ${i + 1}/${urls.length} · ${formatBytes(totalWritten)}`,
+          );
+        }
+      }
+      return { filename: suggestedName, totalWritten };
+    });
+  }
+
+  async function collectUrlsToMemory(urls, btn, dlId, label, byteLimit) {
+    const blobs = [];
+    let totalBytes = 0;
+    for (let i = 0; i < urls.length; i++) {
+      if (isStale(dlId)) {
+        return { blobs: null, totalBytes };
+      }
+      const blob = await fetchBlob(urls[i]);
+      totalBytes += blob.size;
+      if (totalBytes > byteLimit) {
+        throw new Error(
+          `${label} exceeds the safe in-memory download limit (${formatBytes(byteLimit)}). Use a Chromium browser with File System Access support for large downloads.`,
+        );
+      }
+      blobs.push(blob);
+      if (!isStale(dlId)) {
+        setBtnProgress(
+          btn,
+          `${label} ${i + 1}/${urls.length} · ${formatBytes(totalBytes)}`,
+        );
+      }
+    }
+    return { blobs, totalBytes };
+  }
+
+  async function estimateSegmentedDownloadBytes(urls) {
+    if (!Array.isArray(urls) || urls.length === 0) {
+      return null;
+    }
+    const sampleIndexes = [...new Set([
+      0,
+      Math.floor((urls.length - 1) / 2),
+      urls.length - 1,
+    ])];
+    const sampleLengths = [];
+    for (const index of sampleIndexes) {
+      const sample = await probeRemoteResource(urls[index]);
+      if (Number.isFinite(sample.length) && sample.length > 0) {
+        sampleLengths.push(sample.length);
+      }
+    }
+    if (sampleLengths.length === 0) {
+      return null;
+    }
+    const average =
+      sampleLengths.reduce((sum, value) => sum + value, 0) / sampleLengths.length;
+    return Math.round(average * urls.length);
+  }
+
+  function shouldStreamSegmentedDownload(urls, estimatedBytes, requiresMux = false) {
+    if (!canUseFileSystemAccess()) {
+      return false;
+    }
+    if (urls.length >= LARGE_SEGMENT_COUNT_THRESHOLD) {
+      return true;
+    }
+    if (Number.isFinite(estimatedBytes) && estimatedBytes > MAX_IN_MEMORY_DOWNLOAD_BYTES) {
+      return true;
+    }
+    if (requiresMux && Number.isFinite(estimatedBytes) && estimatedBytes > MAX_FFMPEG_INPUT_BYTES) {
+      return true;
+    }
+    return false;
+  }
+
+  async function maybeDownloadDirectToFile(url, suggestedName, btn, dlId) {
+    const safeUrl = ensureHttpUrl(url, "maybeDownloadDirectToFile");
+    if (!canUseFileSystemAccess()) {
+      return false;
+    }
+    const probe = await probeRemoteResource(safeUrl);
+    if (!probe.acceptRanges || !Number.isFinite(probe.length)) {
+      return false;
+    }
+    if (probe.length <= MAX_IN_MEMORY_DOWNLOAD_BYTES) {
+      return false;
+    }
+    if (probe.length > TARGET_LARGE_DOWNLOAD_BYTES) {
+      Log.info(
+        `Direct file exceeds ${formatBytes(TARGET_LARGE_DOWNLOAD_BYTES)}; using chunked disk write.`,
+      );
+    }
+    await withSaveTarget(
+      suggestedName,
+      probe.mime || "application/octet-stream",
+      async (writable) => {
+        let offset = 0;
+        while (offset < probe.length) {
+          if (isStale(dlId)) {
+            throw new Error("Download cancelled");
+          }
+          const end = Math.min(offset + DIRECT_CHUNK_SIZE_BYTES - 1, probe.length - 1);
+          const blob = await fetchBlobRange(safeUrl, offset, end);
+          await writable.write(blob);
+          offset = end + 1;
+          if (!isStale(dlId)) {
+            setBtnProgress(
+              btn,
+              `${Math.round((offset / probe.length) * 100)}% · ${formatBytes(offset)}`,
+            );
+          }
+        }
+      },
+    );
+    return true;
+  }
+
   function getMimeExtension(mime, fallback = "bin") {
     const normalized = String(mime || "").toLowerCase();
     if (!normalized) {
@@ -987,7 +1545,7 @@
       setTimeout(() => {
         a.remove();
         URL.revokeObjectURL(url);
-      }, 30000);
+      }, BLOB_URL_REVOKE_DELAY_MS);
     }, 100);
   }
 
@@ -1004,13 +1562,35 @@
   }
 
   function formatBytes(b) {
+    if (!Number.isFinite(b) || b <= 0) {
+      return "0 B";
+    }
     if (b < 1024) {
       return b + " B";
     }
     if (b < 1048576) {
       return (b / 1024).toFixed(0) + " KB";
     }
-    return (b / 1048576).toFixed(1) + " MB";
+    if (b < 1073741824) {
+      return (b / 1048576).toFixed(1) + " MB";
+    }
+    if (b < 1099511627776) {
+      return (b / 1073741824).toFixed(2) + " GB";
+    }
+    return (b / 1099511627776).toFixed(2) + " TB";
+  }
+
+  function formatExactByteCount(bytes) {
+    const safeBytes = Math.max(0, Math.floor(bytes || 0));
+    try {
+      return new Intl.NumberFormat().format(safeBytes);
+    } catch {
+      return String(safeBytes);
+    }
+  }
+
+  function formatExactBytes(bytes) {
+    return `${formatExactByteCount(bytes)} B`;
   }
 
   function toUrl(rawUrl, base = window.location.href) {
@@ -1062,7 +1642,24 @@
     if (trimmed.startsWith("reddit:") || isBlobUrl(trimmed)) {
       return trimmed;
     }
+    if (trimmed.startsWith("sniff:")) {
+      const safe = toHttpUrl(trimmed.slice("sniff:".length));
+      return safe ? `sniff:${safe.href}` : null;
+    }
     const safe = toHttpUrl(trimmed);
+    return safe ? safe.href : null;
+  }
+
+  function buildSniffRoute(url) {
+    const safe = toHttpUrl(url);
+    return safe ? `sniff:${safe.href}` : null;
+  }
+
+  function parseSniffRoute(route) {
+    if (typeof route !== "string" || !route.startsWith("sniff:")) {
+      return null;
+    }
+    const safe = toHttpUrl(route.slice("sniff:".length));
     return safe ? safe.href : null;
   }
 
@@ -1233,6 +1830,12 @@
 
             var OF = window.__omnifetch = window.__omnifetch || {};
             var mediaSourceIds = new WeakMap();
+            var spoolWorker = null;
+            var spoolReady = false;
+            var spoolInitPromise = null;
+            var spoolRequestCounter = 0;
+            var spoolPendingRequests = {};
+            var spoolWorkerSource = ${JSON.stringify(MSE_SPOOL_WORKER_SOURCE)};
 
             OF.sessions = OF.sessions || {};
             OF.sessionOrder = Array.isArray(OF.sessionOrder) ? OF.sessionOrder : [];
@@ -1241,9 +1844,14 @@
             OF.lastPlayingSrc = OF.lastPlayingSrc || '';
             OF.videoChunks = Array.isArray(OF.videoChunks) ? OF.videoChunks : [];
             OF.audioChunks = Array.isArray(OF.audioChunks) ? OF.audioChunks : [];
+            OF.videoChunkCount = OF.videoChunkCount || 0;
+            OF.audioChunkCount = OF.audioChunkCount || 0;
             OF.videoMime = OF.videoMime || '';
             OF.audioMime = OF.audioMime || '';
+            OF.videoStorageMode = OF.videoStorageMode || 'memory';
+            OF.audioStorageMode = OF.audioStorageMode || 'memory';
             OF.captureLimitReached = Boolean(OF.captureLimitReached);
+            OF.captureStopReason = OF.captureStopReason || '';
             OF.mseComplete = Boolean(OF.mseComplete);
             OF.sniffedUrls = Array.isArray(OF.sniffedUrls) ? OF.sniffedUrls : [];
             OF.totalVideoBytes = OF.totalVideoBytes || 0;
@@ -1251,15 +1859,35 @@
             OF.totalCapturedBytes = OF.totalCapturedBytes || 0;
             OF.sessionCounter = OF.sessionCounter || 0;
             OF.maxBytes = ${settings.maxMSEMemoryMB * 1024 * 1024};
+            OF.maxPendingSpoolBytes = ${MAX_MSE_SPOOL_PENDING_BYTES};
             OF.maxSessions = 12;
+            OF.maxSessionAgeMs = 120000;
             OF.captureEnabled = ${settings.enableMSECapture};
             OF.sniffEnabled = ${settings.enableNetworkSniff};
             OF.autoDownload = ${settings.autoDownloadMSE ? 1 : 0};
+            OF.legacyTrackDumpRequested = false;
             OF.maxSniffedUrls = ${settings.maxSniffedUrls};
+            OF.quickPlay = 1.0;
+            OF.diskCaptureAvailable = Boolean(OF.diskCaptureAvailable);
+            OF.spoolStatus = OF.spoolStatus || 'memory';
 
-            if (typeof window.autoDownload !== 'number') window.autoDownload = OF.autoDownload;
-            if (typeof window.downloadAll !== 'number') window.downloadAll = 0;
-            if (typeof window.quickPlay !== 'number') window.quickPlay = 1.0;
+            function defineReadonlyCompatFlag(name, getter) {
+                try {
+                    Object.defineProperty(window, name, {
+                        get: getter,
+                        set: function () {},
+                        configurable: false
+                    });
+                } catch (e) {
+                    try {
+                        window[name] = getter();
+                    } catch (innerError) {}
+                }
+            }
+
+            defineReadonlyCompatFlag('autoDownload', function () { return OF.autoDownload; });
+            defineReadonlyCompatFlag('downloadAll', function () { return OF.legacyTrackDumpRequested ? 1 : 0; });
+            defineReadonlyCompatFlag('quickPlay', function () { return OF.quickPlay; });
 
             function normalizeUrl(raw) {
                 if (typeof raw !== 'string' || !raw.trim()) {
@@ -1281,12 +1909,78 @@
                 } catch (e) {}
             }
 
+            function getTrackDescriptor(kind) {
+                return kind === 'video'
+                    ? {
+                        bytes: 'totalVideoBytes',
+                        chunks: 'videoChunks',
+                        count: 'videoChunkCount',
+                        mime: 'videoMime',
+                        mode: 'videoStorageMode',
+                        pending: 'videoPendingBytes',
+                        token: 'videoTrackToken'
+                    }
+                    : {
+                        bytes: 'totalAudioBytes',
+                        chunks: 'audioChunks',
+                        count: 'audioChunkCount',
+                        mime: 'audioMime',
+                        mode: 'audioStorageMode',
+                        pending: 'audioPendingBytes',
+                        token: 'audioTrackToken'
+                    };
+            }
+
+            function getTrackBytes(session, kind) {
+                return session[getTrackDescriptor(kind).bytes] || 0;
+            }
+
+            function getTrackChunkCount(session, kind) {
+                return session[getTrackDescriptor(kind).count] || 0;
+            }
+
+            function getTrackMode(session, kind) {
+                return session[getTrackDescriptor(kind).mode] || 'memory';
+            }
+
+            function hasSessionTrackData(session, kind) {
+                return getTrackBytes(session, kind) > 0 || getTrackChunkCount(session, kind) > 0;
+            }
+
+            function hasSessionPayload(session) {
+                return hasSessionTrackData(session, 'video') || hasSessionTrackData(session, 'audio');
+            }
+
+            function releaseCapturedBytes(amount) {
+                OF.totalCapturedBytes = Math.max(0, (OF.totalCapturedBytes || 0) - Math.max(0, amount || 0));
+            }
+
+            function releaseTrackMemory(session, kind) {
+                if (getTrackMode(session, kind) === 'memory') {
+                    releaseCapturedBytes(getTrackBytes(session, kind));
+                }
+            }
+
+            function markCaptureIssue(session, reason) {
+                session.captureLimitReached = true;
+                session.captureStopReason = reason || session.captureStopReason || 'capture-stopped';
+                session.updatedAt = Date.now();
+                if (!OF.activeSessionId || OF.activeSessionId === session.id || session.objectUrl === OF.lastPlayingSrc) {
+                    syncLegacySession(session);
+                }
+            }
+
             function createSession(id) {
                 return {
                     captureLimitReached: false,
+                    captureStopReason: '',
                     id: id,
                     audioChunks: [],
+                    audioChunkCount: 0,
                     audioMime: '',
+                    audioPendingBytes: 0,
+                    audioStorageMode: 'memory',
+                    audioTrackToken: 0,
                     createdAt: Date.now(),
                     mseComplete: false,
                     objectUrl: '',
@@ -1294,12 +1988,142 @@
                     totalVideoBytes: 0,
                     updatedAt: Date.now(),
                     videoChunks: [],
-                    videoMime: ''
+                    videoChunkCount: 0,
+                    videoPendingBytes: 0,
+                    videoMime: '',
+                    videoStorageMode: 'memory',
+                    videoTrackToken: 0
                 };
             }
 
-            function releaseCapturedBytes(amount) {
-                OF.totalCapturedBytes = Math.max(0, (OF.totalCapturedBytes || 0) - Math.max(0, amount || 0));
+            function callSpoolWorker(type, payload, transferList) {
+                if (!spoolWorker) {
+                    return Promise.reject(new Error('OPFS spool worker unavailable'));
+                }
+                spoolRequestCounter += 1;
+                var requestId = 'spool_' + spoolRequestCounter;
+                return new Promise(function (resolve, reject) {
+                    spoolPendingRequests[requestId] = { resolve: resolve, reject: reject };
+                    try {
+                        spoolWorker.postMessage({
+                            id: requestId,
+                            payload: payload || {},
+                            type: type
+                        }, transferList || []);
+                    } catch (error) {
+                        delete spoolPendingRequests[requestId];
+                        reject(error);
+                    }
+                });
+            }
+
+            function initSpoolWorker() {
+                if (spoolInitPromise) {
+                    return spoolInitPromise;
+                }
+                if (!window.Worker || !window.Blob || !window.URL || typeof window.URL.createObjectURL !== 'function') {
+                    OF.diskCaptureAvailable = false;
+                    OF.spoolStatus = 'unsupported';
+                    spoolInitPromise = Promise.resolve(false);
+                    return spoolInitPromise;
+                }
+
+                try {
+                    var workerBlob = new window.Blob([spoolWorkerSource], { type: 'text/javascript' });
+                    var workerUrl = window.URL.createObjectURL(workerBlob);
+                    spoolWorker = new window.Worker(workerUrl);
+                    window.URL.revokeObjectURL(workerUrl);
+                } catch (e) {
+                    OF.diskCaptureAvailable = false;
+                    OF.spoolStatus = 'error';
+                    spoolInitPromise = Promise.resolve(false);
+                    return spoolInitPromise;
+                }
+
+                spoolWorker.onmessage = function (event) {
+                    var data = event.data || {};
+                    var pending = spoolPendingRequests[data.id];
+                    if (!pending) {
+                        return;
+                    }
+                    delete spoolPendingRequests[data.id];
+                    if (data.ok) {
+                        pending.resolve(data.result);
+                    } else {
+                        pending.reject(new Error(data.error || 'Spool worker request failed'));
+                    }
+                };
+
+                spoolWorker.onerror = function () {
+                    spoolReady = false;
+                    OF.diskCaptureAvailable = false;
+                    OF.spoolStatus = 'error';
+                };
+
+                spoolInitPromise = callSpoolWorker('ping', {})
+                    .then(function () {
+                        spoolReady = true;
+                        OF.diskCaptureAvailable = true;
+                        OF.spoolStatus = 'opfs';
+                        return true;
+                    })
+                    .catch(function () {
+                        spoolReady = false;
+                        OF.diskCaptureAvailable = false;
+                        OF.spoolStatus = 'memory';
+                        return false;
+                    });
+
+                return spoolInitPromise;
+            }
+
+            function releaseSessionSpool(sessionId) {
+                if (!spoolWorker) {
+                    return;
+                }
+                callSpoolWorker('releaseSession', { sessionId: sessionId }).catch(function () {});
+            }
+
+            function queueTrackSpoolWrite(session, kind, buffer) {
+                if (!spoolReady || session.captureLimitReached) {
+                    return false;
+                }
+                var descriptor = getTrackDescriptor(kind);
+                var byteLength = buffer.byteLength || 0;
+                var nextPending = (session[descriptor.pending] || 0) + byteLength;
+                if (nextPending > OF.maxPendingSpoolBytes) {
+                    markCaptureIssue(session, 'spool-backpressure');
+                    return false;
+                }
+
+                session[descriptor.pending] = nextPending;
+                var expectedToken = session[descriptor.token] || 0;
+                callSpoolWorker('appendTrack', {
+                    buffer: buffer,
+                    kind: kind,
+                    sessionId: session.id
+                }, [buffer]).then(function () {
+                    var activeSession = OF.sessions[session.id];
+                    if (!activeSession) {
+                        return;
+                    }
+                    var activeDescriptor = getTrackDescriptor(kind);
+                    activeSession[activeDescriptor.pending] = Math.max(0, (activeSession[activeDescriptor.pending] || 0) - byteLength);
+                }).catch(function () {
+                    var activeSession = OF.sessions[session.id];
+                    if (!activeSession) {
+                        return;
+                    }
+                    var activeDescriptor = getTrackDescriptor(kind);
+                    activeSession[activeDescriptor.pending] = Math.max(0, (activeSession[activeDescriptor.pending] || 0) - byteLength);
+                    if ((activeSession[activeDescriptor.token] || 0) !== expectedToken) {
+                        return;
+                    }
+                    activeSession[activeDescriptor.bytes] = Math.max(0, (activeSession[activeDescriptor.bytes] || 0) - byteLength);
+                    activeSession[activeDescriptor.count] = Math.max(0, (activeSession[activeDescriptor.count] || 0) - 1);
+                    markCaptureIssue(activeSession, 'spool-error');
+                });
+                return true;
             }
 
             function dropSession(id) {
@@ -1307,7 +2131,9 @@
                 if (!session) {
                     return;
                 }
-                releaseCapturedBytes((session.totalVideoBytes || 0) + (session.totalAudioBytes || 0));
+                releaseTrackMemory(session, 'video');
+                releaseTrackMemory(session, 'audio');
+                releaseSessionSpool(id);
                 if (session.objectUrl) {
                     delete OF.blobUrlToSessionId[session.objectUrl];
                 }
@@ -1319,6 +2145,16 @@
             }
 
             function pruneSessions() {
+                var now = Date.now();
+                OF.sessionOrder.slice().forEach(function (id) {
+                    var session = OF.sessions[id];
+                    if (!session || OF.activeSessionId === id) {
+                        return;
+                    }
+                    if ((now - (session.updatedAt || session.createdAt || now)) > OF.maxSessionAgeMs) {
+                        dropSession(id);
+                    }
+                });
                 while (OF.sessionOrder.length > OF.maxSessions) {
                     var victimId = OF.sessionOrder.find(function (entry) { return entry !== OF.activeSessionId; }) || OF.sessionOrder[0];
                     if (!victimId) {
@@ -1362,14 +2198,14 @@
                 var leftScore = [
                     left && left.objectUrl && left.objectUrl === OF.lastPlayingSrc ? 1 : 0,
                     left && left.mseComplete ? 1 : 0,
-                    left && left.videoChunks && left.videoChunks.length > 0 ? 1 : 0,
+                    left && hasSessionTrackData(left, 'video') ? 1 : 0,
                     left && left.updatedAt ? left.updatedAt : 0,
                     left ? (left.totalVideoBytes || 0) + (left.totalAudioBytes || 0) : 0
                 ];
                 var rightScore = [
                     right && right.objectUrl && right.objectUrl === OF.lastPlayingSrc ? 1 : 0,
                     right && right.mseComplete ? 1 : 0,
-                    right && right.videoChunks && right.videoChunks.length > 0 ? 1 : 0,
+                    right && hasSessionTrackData(right, 'video') ? 1 : 0,
                     right && right.updatedAt ? right.updatedAt : 0,
                     right ? (right.totalVideoBytes || 0) + (right.totalAudioBytes || 0) : 0
                 ];
@@ -1388,7 +2224,7 @@
                     if (!candidate) {
                         return;
                     }
-                    if ((candidate.videoChunks || []).length === 0 && (candidate.audioChunks || []).length === 0) {
+                    if (!hasSessionPayload(candidate)) {
                         return;
                     }
                     if (!best || compareSessions(candidate, best) > 0) {
@@ -1400,18 +2236,20 @@
 
             function syncLegacySession(session) {
                 var activeSession = OF.activeSessionId && OF.sessions[OF.activeSessionId];
-                var hasActivePayload = activeSession && (
-                    (activeSession.videoChunks && activeSession.videoChunks.length > 0) ||
-                    (activeSession.audioChunks && activeSession.audioChunks.length > 0)
-                );
+                var hasActivePayload = activeSession && hasSessionPayload(activeSession);
                 var nextSession = session || (hasActivePayload ? activeSession : null) || getBestSession();
                 if (!nextSession) {
                     OF.activeSessionId = '';
                     OF.videoChunks = [];
                     OF.audioChunks = [];
+                    OF.videoChunkCount = 0;
+                    OF.audioChunkCount = 0;
                     OF.videoMime = '';
                     OF.audioMime = '';
+                    OF.videoStorageMode = OF.diskCaptureAvailable ? 'opfs' : 'memory';
+                    OF.audioStorageMode = OF.diskCaptureAvailable ? 'opfs' : 'memory';
                     OF.captureLimitReached = false;
+                    OF.captureStopReason = '';
                     OF.totalVideoBytes = 0;
                     OF.totalAudioBytes = 0;
                     OF.mseComplete = false;
@@ -1419,9 +2257,14 @@
                     OF.activeSessionId = nextSession.id;
                     OF.videoChunks = nextSession.videoChunks;
                     OF.audioChunks = nextSession.audioChunks;
+                    OF.videoChunkCount = nextSession.videoChunkCount || 0;
+                    OF.audioChunkCount = nextSession.audioChunkCount || 0;
                     OF.videoMime = nextSession.videoMime;
                     OF.audioMime = nextSession.audioMime;
+                    OF.videoStorageMode = nextSession.videoStorageMode || 'memory';
+                    OF.audioStorageMode = nextSession.audioStorageMode || 'memory';
                     OF.captureLimitReached = Boolean(nextSession.captureLimitReached);
+                    OF.captureStopReason = nextSession.captureStopReason || '';
                     OF.totalVideoBytes = nextSession.totalVideoBytes;
                     OF.totalAudioBytes = nextSession.totalAudioBytes;
                     OF.mseComplete = Boolean(nextSession.mseComplete);
@@ -1450,6 +2293,34 @@
             OF.syncActiveSession = function () {
                 return syncLegacySession(resolveSessionBySource(OF.lastPlayingSrc));
             };
+            OF.getTrackBlobBySource = async function (sourceUrl, kind) {
+                var session = resolveSessionBySource(sourceUrl || OF.lastPlayingSrc);
+                if (!session) {
+                    return null;
+                }
+                var descriptor = getTrackDescriptor(kind);
+                var mime = session[descriptor.mime] || (kind === 'video' ? 'video/mp4' : 'audio/mp4');
+                if (session[descriptor.mode] === 'opfs' && session[descriptor.bytes] > 0 && spoolReady) {
+                    var snapshot = await callSpoolWorker('snapshotTrack', {
+                        kind: kind,
+                        sessionId: session.id
+                    });
+                    if (snapshot && snapshot.file) {
+                        return snapshot.file.type ? snapshot.file : snapshot.file.slice(0, snapshot.file.size, mime);
+                    }
+                }
+                return new Blob(session[descriptor.chunks] || [], { type: mime });
+            };
+            OF.releaseSessionBySource = function (sourceUrl) {
+                var session = resolveSessionBySource(sourceUrl);
+                if (!session) {
+                    return false;
+                }
+                var releasedId = session.id;
+                dropSession(releasedId);
+                syncLegacySession(resolveSessionBySource(''));
+                return releasedId;
+            };
             OF.resetCaptureState = function () {
                 Object.keys(OF.sessions).forEach(dropSession);
                 OF.sessions = {};
@@ -1460,32 +2331,92 @@
                 OF.sniffedUrls = [];
                 OF.captureLimitReached = false;
                 OF.totalCapturedBytes = 0;
+                OF.legacyTrackDumpRequested = false;
                 syncLegacySession(null);
-                window.downloadAll = 0;
                 window.isComplete = 0;
             };
 
             function resetTrack(session, kind, mimeStr) {
-                if (kind === 'video') {
-                    releaseCapturedBytes(session.totalVideoBytes);
-                    session.videoChunks = [];
-                    session.videoMime = mimeStr;
-                    session.totalVideoBytes = 0;
-                }
-                if (kind === 'audio') {
-                    releaseCapturedBytes(session.totalAudioBytes);
-                    session.audioChunks = [];
-                    session.audioMime = mimeStr;
-                    session.totalAudioBytes = 0;
-                }
+                var descriptor = getTrackDescriptor(kind);
+                releaseTrackMemory(session, kind);
+                session[descriptor.chunks] = [];
+                session[descriptor.mime] = mimeStr;
+                session[descriptor.bytes] = 0;
+                session[descriptor.count] = 0;
+                session[descriptor.pending] = 0;
+                session[descriptor.token] = (session[descriptor.token] || 0) + 1;
+                session[descriptor.mode] = spoolReady ? 'opfs' : 'memory';
                 session.captureLimitReached = false;
+                session.captureStopReason = '';
                 session.mseComplete = false;
                 session.updatedAt = Date.now();
+                if (spoolReady) {
+                    callSpoolWorker('resetTrack', {
+                        kind: kind,
+                        sessionId: session.id
+                    }).catch(function () {
+                        session[descriptor.mode] = 'memory';
+                        session.updatedAt = Date.now();
+                        if (!OF.activeSessionId || OF.activeSessionId === session.id) {
+                            syncLegacySession(session);
+                        }
+                    });
+                }
                 if (!OF.activeSessionId || OF.activeSessionId === session.id) {
                     syncLegacySession(session);
                 } else {
                     syncLegacySession(null);
                 }
+            }
+
+            function captureTrackBytes(session, kind, bytes) {
+                if (!bytes || !bytes.byteLength || session.captureLimitReached) {
+                    return;
+                }
+
+                var descriptor = getTrackDescriptor(kind);
+                if (
+                    session[descriptor.mode] !== 'opfs' &&
+                    spoolReady &&
+                    (session[descriptor.bytes] || 0) === 0 &&
+                    (session[descriptor.count] || 0) === 0
+                ) {
+                    session[descriptor.mode] = 'opfs';
+                }
+                if (session[descriptor.mode] === 'opfs' && spoolReady) {
+                    var diskCopy = new Uint8Array(bytes.byteLength);
+                    diskCopy.set(bytes);
+                    if (queueTrackSpoolWrite(session, kind, diskCopy.buffer)) {
+                        session[descriptor.bytes] += bytes.byteLength;
+                        session[descriptor.count] += 1;
+                        session.updatedAt = Date.now();
+                        if (!OF.activeSessionId || OF.activeSessionId === session.id || session.objectUrl === OF.lastPlayingSrc) {
+                            syncLegacySession(session);
+                        }
+                    }
+                    return;
+                }
+
+                var totalNow = (OF.totalCapturedBytes || 0) + bytes.byteLength;
+                if (totalNow > OF.maxBytes) {
+                    markCaptureIssue(session, 'memory-cap');
+                    return;
+                }
+
+                var copy = new Uint8Array(bytes.byteLength);
+                copy.set(bytes);
+                session[descriptor.chunks].push(copy.buffer);
+                session[descriptor.bytes] += bytes.byteLength;
+                session[descriptor.count] += 1;
+                OF.totalCapturedBytes = totalNow;
+                session.updatedAt = Date.now();
+                if (!OF.activeSessionId || OF.activeSessionId === session.id || session.objectUrl === OF.lastPlayingSrc) {
+                    syncLegacySession(session);
+                }
+            }
+
+            if (OF.captureEnabled) {
+                initSpoolWorker();
             }
 
             if (window.URL && typeof window.URL.createObjectURL === 'function' && !window.__omnifetchCreateObjectUrlHooked) {
@@ -1533,7 +2464,6 @@
                             resetTrack(session, 'audio', mimeStr);
                         }
 
-                        window.downloadAll = 0;
                         window.isComplete = 0;
 
                         var sourceBuffer = _addSB.call(this, mime);
@@ -1546,29 +2476,11 @@
                                     else if (ArrayBuffer.isView(buffer)) bytes = new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
                                     else bytes = new Uint8Array(buffer);
 
-                                    var totalNow = (OF.totalCapturedBytes || 0) + bytes.byteLength;
-                                    if (totalNow <= OF.maxBytes) {
-                                        var copy = new Uint8Array(bytes.byteLength);
-                                        copy.set(bytes);
-                                        if (isVideo) {
-                                            session.videoChunks.push(copy.buffer);
-                                            session.totalVideoBytes += bytes.byteLength;
-                                        }
-                                        if (isAudio) {
-                                            session.audioChunks.push(copy.buffer);
-                                            session.totalAudioBytes += bytes.byteLength;
-                                        }
-                                        OF.totalCapturedBytes = totalNow;
-                                        session.updatedAt = Date.now();
-                                        if (!OF.activeSessionId || OF.activeSessionId === session.id || session.objectUrl === OF.lastPlayingSrc) {
-                                            syncLegacySession(session);
-                                        }
-                                    } else {
-                                        session.captureLimitReached = true;
-                                        session.updatedAt = Date.now();
-                                        if (!OF.activeSessionId || OF.activeSessionId === session.id || session.objectUrl === OF.lastPlayingSrc) {
-                                            syncLegacySession(session);
-                                        }
+                                    if (isVideo) {
+                                        captureTrackBytes(session, 'video', bytes);
+                                    }
+                                    if (isAudio) {
+                                        captureTrackBytes(session, 'audio', bytes);
                                     }
                                 } catch (e) {}
                                 return _append.call(this, buffer);
@@ -1590,7 +2502,7 @@
                                 detail: { sessionId: session.id, sourceUrl: session.objectUrl || '' }
                             }));
                         } catch (e) {}
-                        if (window.autoDownload === 1) {
+                        if (OF.autoDownload === 1) {
                             try {
                                 window.dispatchEvent(new CustomEvent('omnifetch-auto-download-request', {
                                     detail: { sessionId: session.id, sourceUrl: session.objectUrl || '' }
@@ -2128,6 +3040,54 @@
     return result;
   }
 
+  async function getHLSPlaylistSpec(playlistUrl, trackType = "video") {
+    const text = await fetchText(playlistUrl);
+    const playlist = parseM3U8(text, playlistUrl);
+
+    if (playlist.isEncrypted) {
+      throw new Error("Encrypted HLS stream");
+    }
+    if (playlist.segments.length === 0) {
+      throw new Error("No segments in playlist");
+    }
+
+    const urls = [];
+    if (playlist.initSegment) {
+      urls.push(playlist.initSegment.url);
+    }
+    playlist.segments.forEach((segment) => urls.push(segment.url));
+
+    const mime = playlist.isFMP4
+      ? trackType === "audio"
+        ? "audio/mp4"
+        : "video/mp4"
+      : "video/mp2t";
+    const ext = playlist.isFMP4
+      ? trackType === "audio"
+        ? "m4a"
+        : "mp4"
+      : "ts";
+
+    return {
+      estimatedBytes: await estimateSegmentedDownloadBytes(urls),
+      ext,
+      mime,
+      playlist,
+      totalDuration: playlist.totalDuration,
+      trackType,
+      urls,
+    };
+  }
+
+  function ensureMuxFitsMemory(videoBytes, audioBytes, label) {
+    const totalBytes = (videoBytes || 0) + (audioBytes || 0);
+    if (totalBytes > MAX_FFMPEG_INPUT_BYTES) {
+      throw new Error(
+        `${label} is too large to mux safely in-browser (${formatBytes(totalBytes)}). OmniFetch will only mux smaller captures; use disk-streaming track downloads for large segmented media.`,
+      );
+    }
+  }
+
   async function downloadHLS(m3u8Url, btn, dlId) {
     Log.info("HLS download:", m3u8Url);
     const masterText = await fetchText(m3u8Url);
@@ -2141,6 +3101,7 @@
 
     let videoPlaylistUrl = m3u8Url;
     let audioPlaylistUrl = null;
+    const baseName = sanitizeFilenameSegment(document.title || "video_download");
 
     if (master.isMaster) {
       // Pick best variant
@@ -2166,104 +3127,161 @@
       }
     }
 
-    // Download video segments
-    const videoBlob = await downloadHLSPlaylist(
-      videoPlaylistUrl,
-      btn,
-      dlId,
-      "V",
-    );
-    if (isStale(dlId) || !videoBlob) {
+    const videoSpec = await getHLSPlaylistSpec(videoPlaylistUrl, "video");
+    if (isStale(dlId)) {
       return;
     }
+    Log.info(
+      `HLS[V]: ${videoSpec.urls.length} segments, ~${videoSpec.totalDuration.toFixed(0)}s, fMP4=${videoSpec.playlist.isFMP4}`,
+    );
 
-    let finalBlob = videoBlob;
-    let alreadyMuxed = false;
+    let audioSpec = null;
 
     // Download audio segments if separate
     if (audioPlaylistUrl) {
-      Log.info("HLS: downloading separate audio rendition");
-      setBtnProgress(btn, "Audio...");
-      const audioBlob = await downloadHLSPlaylist(
-        audioPlaylistUrl,
+      audioSpec = await getHLSPlaylistSpec(audioPlaylistUrl, "audio");
+      Log.info(
+        `HLS[A]: ${audioSpec.urls.length} segments, ~${audioSpec.totalDuration.toFixed(0)}s, fMP4=${audioSpec.playlist.isFMP4}`,
+      );
+    }
+
+    const combinedEstimate =
+      (videoSpec.estimatedBytes || 0) + (audioSpec?.estimatedBytes || 0);
+    const shouldStreamToDisk =
+      shouldStreamSegmentedDownload(
+        videoSpec.urls,
+        videoSpec.estimatedBytes,
+        Boolean(audioSpec),
+      ) ||
+      (audioSpec &&
+        shouldStreamSegmentedDownload(
+          audioSpec.urls,
+          combinedEstimate,
+          true,
+        ));
+
+    if (shouldStreamToDisk) {
+      if (audioSpec) {
+        alert(
+          "Large HLS streams with separate audio and video tracks will be saved as separate files to avoid exhausting browser memory.",
+        );
+      }
+      await writeSequentialUrlsToFile(
+        videoSpec.urls,
+        `${baseName}_video.${videoSpec.ext}`,
+        videoSpec.mime,
+        btn,
+        dlId,
+        "V",
+      );
+      if (audioSpec && !isStale(dlId)) {
+        await writeSequentialUrlsToFile(
+          audioSpec.urls,
+          `${baseName}_audio.${audioSpec.ext}`,
+          audioSpec.mime,
+          btn,
+          dlId,
+          "A",
+        );
+      }
+      return;
+    }
+
+    const videoPayload = await collectUrlsToMemory(
+      videoSpec.urls,
+      btn,
+      dlId,
+      "V",
+      MAX_IN_MEMORY_DOWNLOAD_BYTES,
+    );
+    if (isStale(dlId) || !videoPayload.blobs) {
+      return;
+    }
+    const videoBlob = new Blob(videoPayload.blobs, { type: videoSpec.mime });
+
+    if (audioSpec) {
+      const audioPayload = await collectUrlsToMemory(
+        audioSpec.urls,
         btn,
         dlId,
         "A",
+        MAX_IN_MEMORY_DOWNLOAD_BYTES,
       );
-      if (isStale(dlId)) {
+      if (isStale(dlId) || !audioPayload.blobs) {
         return;
       }
-      if (audioBlob) {
-        const muxed = await muxVideoAudio(videoBlob, audioBlob);
-        if (muxed) {
-          finalBlob = muxed;
-          alreadyMuxed = true;
-        } else {
-          triggerBlobDownload(videoBlob, "video_track.mp4");
-          setTimeout(
-            () => triggerBlobDownload(audioBlob, "audio_track.m4a"),
-            500,
-          );
-          return;
-        }
+      ensureMuxFitsMemory(videoPayload.totalBytes, audioPayload.totalBytes, "HLS");
+      const audioBlob = new Blob(audioPayload.blobs, { type: audioSpec.mime });
+      const muxed = await muxVideoAudio(videoBlob, audioBlob);
+      if (muxed) {
+        triggerBlobDownload(
+          muxed,
+          buildMediaFilename(baseName, muxed.type || "video/mp4", "mp4"),
+        );
+      } else {
+        triggerBlobDownload(videoBlob, `${baseName}_video.${videoSpec.ext}`);
+        setTimeout(
+          () => triggerBlobDownload(audioBlob, `${baseName}_audio.${audioSpec.ext}`),
+          500,
+        );
       }
+      return;
     }
 
-    // Always remux concatenated segments to fix timestamp gaps / blank frames,
-    // unless muxVideoAudio already ran (which applies the same timestamp fixes).
-    if (!alreadyMuxed && !isStale(dlId)) {
+    // Keep remux for smaller single-track HLS downloads only.
+    let finalBlob = videoBlob;
+    if (!isStale(dlId) && videoSpec.ext === "ts") {
       setBtnProgress(btn, "Remux...");
-      const ext = videoBlob.type === "video/mp4" ? "mp4" : "ts";
-      const remuxed = await remuxToMP4(finalBlob, ext);
+      const remuxed = await remuxToMP4(finalBlob, "ts");
       if (remuxed) {
         finalBlob = remuxed;
       }
     }
 
     if (!isStale(dlId)) {
-      const ext = finalBlob.type === "video/mp4" ? ".mp4" : ".ts";
-      triggerBlobDownload(finalBlob, "video_download" + ext);
+      triggerBlobDownload(
+        finalBlob,
+        buildMediaFilename(baseName, finalBlob.type || videoSpec.mime, videoSpec.ext),
+      );
     }
   }
 
-  async function downloadHLSPlaylist(playlistUrl, btn, dlId, label) {
-    const text = await fetchText(playlistUrl);
-    const playlist = parseM3U8(text, playlistUrl);
+  function buildDashTrackSpec(rep, trackType) {
+    const mime =
+      rep?.mime ||
+      (trackType === "audio" ? "audio/mp4" : "video/mp4");
+    return {
+      estimatedBytes: null,
+      ext: getMimeExtension(mime, trackType === "audio" ? "m4a" : "mp4"),
+      mime,
+      trackType,
+      urls: rep?.segments || [],
+    };
+  }
 
-    if (playlist.isEncrypted) {
-      throw new Error("Encrypted HLS stream");
-    }
-    if (playlist.segments.length === 0) {
-      throw new Error("No segments in playlist");
-    }
+  async function enrichDashTrackSpec(spec) {
+    return {
+      ...spec,
+      estimatedBytes: await estimateSegmentedDownloadBytes(spec.urls),
+    };
+  }
 
-    const urls = [];
-    // fMP4: init segment must come first
-    if (playlist.initSegment) {
-      urls.push(playlist.initSegment.url);
-    }
-    playlist.segments.forEach((s) => urls.push(s.url));
-
-    Log.info(
-      `HLS[${label}]: ${urls.length} segments, ~${playlist.totalDuration.toFixed(0)}s, fMP4=${playlist.isFMP4}`,
-    );
-
-    const blobs = await downloadParallel(
-      urls,
-      settings.hlsConcurrency,
-      (done, total) => {
-        if (!isStale(dlId)) {
-          setBtnProgress(btn, `${label} ${done}/${total}`);
+  async function collectDashTrackToMemory(spec, btn, dlId, label) {
+    if (spec.urls.length === 1) {
+      const blob = await fetchBlob(spec.urls[0], (loaded, total) => {
+        if (!isStale(dlId) && total) {
+          setBtnProgress(btn, `${label} ${Math.round((loaded / total) * 100)}%`);
         }
-      },
-    );
-
-    if (isStale(dlId)) {
-      return null;
+      });
+      return { blobs: [blob], totalBytes: blob.size };
     }
-
-    const type = playlist.isFMP4 ? "video/mp4" : "video/mp2t";
-    return new Blob(blobs, { type });
+    return collectUrlsToMemory(
+      spec.urls,
+      btn,
+      dlId,
+      label,
+      MAX_IN_MEMORY_DOWNLOAD_BYTES,
+    );
   }
 
   // =========================================================================
@@ -2435,85 +3453,125 @@
 
     const bestVideo = mpd.video[0];
     const bestAudio = mpd.audio.length > 0 ? mpd.audio[0] : null;
+    const baseName = sanitizeFilenameSegment(document.title || "video_download");
+    const videoSpec = await enrichDashTrackSpec(
+      buildDashTrackSpec(bestVideo, "video"),
+    );
+    const audioSpec = bestAudio
+      ? await enrichDashTrackSpec(buildDashTrackSpec(bestAudio, "audio"))
+      : null;
+    const combinedEstimate =
+      (videoSpec.estimatedBytes || 0) + (audioSpec?.estimatedBytes || 0);
 
     Log.info(
       `DASH: video=${bestVideo.width}x${bestVideo.height} (${bestVideo.segments.length} segs), audio=${bestAudio ? bestAudio.segments.length + " segs" : "none"}`,
     );
 
-    // Download video segments
-    setBtnProgress(btn, "V 0%");
-    let videoBlobs;
-    if (bestVideo.segments.length === 1) {
-      // Single file — direct download
-      const blob = await fetchBlob(bestVideo.segments[0], (loaded, total) => {
-        if (!isStale(dlId) && total) {
-          setBtnProgress(btn, "V " + Math.round((loaded / total) * 100) + "%");
-        }
-      });
-      videoBlobs = [blob];
-    } else {
-      videoBlobs = await downloadParallel(
-        bestVideo.segments,
-        settings.dashConcurrency,
-        (done, total) => {
-          if (!isStale(dlId)) {
-            setBtnProgress(btn, `V ${done}/${total}`);
-          }
-        },
-      );
-    }
-    if (isStale(dlId)) {
-      return;
-    }
-    const videoBlob = new Blob(videoBlobs, { type: "video/mp4" });
+    const shouldStreamToDisk =
+      shouldStreamSegmentedDownload(
+        videoSpec.urls,
+        videoSpec.estimatedBytes,
+        Boolean(audioSpec),
+      ) ||
+      (audioSpec &&
+        shouldStreamSegmentedDownload(
+          audioSpec.urls,
+          combinedEstimate,
+          true,
+        ));
 
-    // Download audio segments
-    if (bestAudio) {
-      setBtnProgress(btn, "A 0%");
-      let audioBlobs;
-      if (bestAudio.segments.length === 1) {
-        const blob = await fetchBlob(bestAudio.segments[0]);
-        audioBlobs = [blob];
-      } else {
-        audioBlobs = await downloadParallel(
-          bestAudio.segments,
-          settings.dashConcurrency,
-          (done, total) => {
-            if (!isStale(dlId)) {
-              setBtnProgress(btn, `A ${done}/${total}`);
-            }
-          },
+    if (shouldStreamToDisk) {
+      if (audioSpec) {
+        alert(
+          "Large DASH streams with separate audio and video tracks will be saved as separate files to avoid exhausting browser memory.",
         );
       }
-      if (isStale(dlId)) {
+      await writeSequentialUrlsToFile(
+        videoSpec.urls,
+        `${baseName}_video.${videoSpec.ext}`,
+        videoSpec.mime,
+        btn,
+        dlId,
+        "V",
+      );
+      if (audioSpec && !isStale(dlId)) {
+        await writeSequentialUrlsToFile(
+          audioSpec.urls,
+          `${baseName}_audio.${audioSpec.ext}`,
+          audioSpec.mime,
+          btn,
+          dlId,
+          "A",
+        );
+      }
+      return;
+    }
+
+    setBtnProgress(btn, "V 0%");
+    const videoPayload = await collectDashTrackToMemory(videoSpec, btn, dlId, "V");
+    if (isStale(dlId) || !videoPayload.blobs) {
+      return;
+    }
+    const videoBlob = new Blob(videoPayload.blobs, { type: videoSpec.mime });
+
+    // Download audio segments
+    if (audioSpec) {
+      setBtnProgress(btn, "A 0%");
+      const audioPayload = await collectDashTrackToMemory(
+        audioSpec,
+        btn,
+        dlId,
+        "A",
+      );
+      if (isStale(dlId) || !audioPayload.blobs) {
         return;
       }
-      const audioBlob = new Blob(audioBlobs, { type: "audio/mp4" });
+      ensureMuxFitsMemory(
+        videoPayload.totalBytes,
+        audioPayload.totalBytes,
+        "DASH",
+      );
+      const audioBlob = new Blob(audioPayload.blobs, { type: audioSpec.mime });
 
       // Mux
       btn.innerHTML = svgMux;
       const muxed = await muxVideoAudio(videoBlob, audioBlob);
       if (muxed) {
-        triggerBlobDownload(muxed, "video_download.mp4");
+        triggerBlobDownload(
+          muxed,
+          buildMediaFilename(baseName, muxed.type || "video/mp4", "mp4"),
+        );
       } else {
-        triggerBlobDownload(videoBlob, "video_track.mp4");
+        triggerBlobDownload(videoBlob, `${baseName}_video.${videoSpec.ext}`);
         setTimeout(
-          () => triggerBlobDownload(audioBlob, "audio_track.m4a"),
+          () => triggerBlobDownload(audioBlob, `${baseName}_audio.${audioSpec.ext}`),
           500,
         );
       }
     } else {
       // Video-only: remux to fix timestamp gaps in concatenated segments
-      if (bestVideo.segments.length > 1) {
+      if (videoSpec.urls.length > 1) {
         setBtnProgress(btn, "Remux...");
-        const remuxed = await remuxToMP4(videoBlob, "mp4");
+        const remuxed = await remuxToMP4(
+          videoBlob,
+          videoSpec.ext === "ts" ? "ts" : "mp4",
+        );
         if (remuxed) {
-          triggerBlobDownload(remuxed, "video_download.mp4");
+          triggerBlobDownload(
+            remuxed,
+            buildMediaFilename(baseName, remuxed.type, "mp4"),
+          );
         } else {
-          triggerBlobDownload(videoBlob, "video_download.mp4");
+          triggerBlobDownload(
+            videoBlob,
+            buildMediaFilename(baseName, videoBlob.type, videoSpec.ext),
+          );
         }
       } else {
-        triggerBlobDownload(videoBlob, "video_download.mp4");
+        triggerBlobDownload(
+          videoBlob,
+          buildMediaFilename(baseName, videoBlob.type, videoSpec.ext),
+        );
       }
     }
   }
@@ -2613,6 +3671,12 @@
       }
       // Reddit
       if (HOST.includes("reddit.com") && settings.enableReddit) {
+        const directRedditSrc = normalizeRouteSource(
+          video.currentSrc || video.src || video.querySelector("source")?.src,
+        );
+        if (directRedditSrc) {
+          return directRedditSrc;
+        }
         const post = video.closest("shreddit-post") || video.closest(".thing");
         let permalink = window.location.pathname;
         if (post?.getAttribute("permalink")) {
@@ -2695,10 +3759,6 @@
           return src;
         }
       }
-      // Sniffed manifests (prefer m3u8 over mpd)
-      if (sniffedManifestUrls.length > 0) {
-        return pickPreferredManifestUrl(sniffedManifestUrls);
-      }
     } catch (e) {
       Log.warn("Extractor exception:", e.message);
     }
@@ -2725,9 +3785,11 @@
   let sniffedManifestUrls = [];
   const sniffedManifestMeta = new Map();
   const videoListenerRegistry = new Map();
+  const approvedSniffHosts = new Set();
+  const approvedThirdPartyHosts = new Set();
 
   function isAutoDownloadEnabled() {
-    return settings.autoDownloadMSE || uWindow.autoDownload === 1;
+    return settings.autoDownloadMSE;
   }
 
   function syncActiveMSEState(preferredSource = activeVideoSrc) {
@@ -2744,9 +3806,74 @@
     return of;
   }
 
+  function releaseActiveMSECapture(preferredSource = activeVideoSrc) {
+    const of = uWindow.__omnifetch || {};
+    try {
+      if (
+        preferredSource &&
+        typeof of.releaseSessionBySource === "function" &&
+        of.releaseSessionBySource(preferredSource)
+      ) {
+        Log.debug("Released completed MSE capture for", preferredSource);
+      }
+    } catch (e) {
+      Log.debug("MSE release failed:", e.message);
+    }
+  }
+
+  function getMSETrackChunkCount(of, kind) {
+    const countKey = kind === "video" ? "videoChunkCount" : "audioChunkCount";
+    const chunksKey = kind === "video" ? "videoChunks" : "audioChunks";
+    const explicitCount = parseInt(of?.[countKey], 10);
+    if (Number.isFinite(explicitCount)) {
+      return explicitCount;
+    }
+    return Array.isArray(of?.[chunksKey]) ? of[chunksKey].length : 0;
+  }
+
+  function getMSETrackByteCount(of, kind) {
+    return kind === "video" ? of?.totalVideoBytes || 0 : of?.totalAudioBytes || 0;
+  }
+
+  function hasMSETrackData(of, kind) {
+    return (
+      getMSETrackByteCount(of, kind) > 0 || getMSETrackChunkCount(of, kind) > 0
+    );
+  }
+
+  function hasAnyMSETrackData(of) {
+    return hasMSETrackData(of, "video") || hasMSETrackData(of, "audio");
+  }
+
+  function getMSETrackStorageMode(of, kind) {
+    return kind === "video"
+      ? of?.videoStorageMode || "memory"
+      : of?.audioStorageMode || "memory";
+  }
+
+  async function getMSETrackBlob(
+    of,
+    kind,
+    preferredSource = activeVideoSrc,
+    fallbackMime = kind === "video" ? "video/mp4" : "audio/mp4",
+  ) {
+    if (typeof of?.getTrackBlobBySource === "function") {
+      const exported = await of.getTrackBlobBySource(preferredSource || "", kind);
+      if (exported) {
+        return exported.type
+          ? exported
+          : exported.slice(0, exported.size, fallbackMime);
+      }
+    }
+
+    const chunks = kind === "video" ? of?.videoChunks : of?.audioChunks;
+    const mime = kind === "video" ? of?.videoMime : of?.audioMime;
+    return createMediaBlob(chunks || [], mime, fallbackMime);
+  }
+
   function getMSECaptureSignature(of) {
-    const vCount = (of.videoChunks || []).length;
-    const aCount = (of.audioChunks || []).length;
+    const vCount = getMSETrackChunkCount(of, "video");
+    const aCount = getMSETrackChunkCount(of, "audio");
     return [
       of.activeSessionId || "",
       of.captureLimitReached ? "truncated" : "complete",
@@ -2754,6 +3881,8 @@
       of.totalAudioBytes || 0,
       vCount,
       aCount,
+      getMSETrackStorageMode(of, "video"),
+      getMSETrackStorageMode(of, "audio"),
       of.videoMime || "",
       of.audioMime || "",
     ].join("|");
@@ -2779,27 +3908,111 @@
     );
   }
 
-  function triggerLegacyTrackDump(sourceUrl = activeVideoSrc) {
-    const of = syncActiveMSEState(sourceUrl);
-    const vChunks = of.videoChunks || [];
-    const aChunks = of.audioChunks || [];
-    const titleSafe = sanitizeFilenameSegment(document.title);
+  function getAggregateMSEStorageMode(of) {
+    const hasVideo = hasMSETrackData(of, "video");
+    const hasAudio = hasMSETrackData(of, "audio");
+    const videoMode = getMSETrackStorageMode(of, "video");
+    const audioMode = getMSETrackStorageMode(of, "audio");
 
-    if (aChunks.length > 0) {
-      const audioBlob = createMediaBlob(aChunks, of.audioMime, "audio/mp4");
-      triggerBlobDownload(
-        audioBlob,
-        buildMediaFilename(`audio_${titleSafe}`, audioBlob.type, "m4a"),
-      );
+    if (hasVideo && hasAudio && videoMode !== audioMode) {
+      return "mixed";
     }
-    if (vChunks.length > 0) {
-      const videoBlob = createMediaBlob(vChunks, of.videoMime, "video/mp4");
-      triggerBlobDownload(
-        videoBlob,
-        buildMediaFilename(`video_${titleSafe}`, videoBlob.type, "mp4"),
-      );
+    if (hasVideo) {
+      return videoMode;
     }
-    uWindow.downloadAll = 0;
+    if (hasAudio) {
+      return audioMode;
+    }
+    return of?.diskCaptureAvailable ? "opfs" : "memory";
+  }
+
+  function updateMSEStatusIndicator(src = activeVideoSrc) {
+    const indicator = document.getElementById("omnifetch-mse-status");
+    if (!indicator) {
+      return;
+    }
+
+    const routedSrc = normalizeRouteSource(src);
+    if (!routedSrc || !isBlobUrl(routedSrc)) {
+      indicator.style.display = "none";
+      indicator.dataset.mode = "";
+      indicator.title = "";
+      return;
+    }
+
+    const of = syncActiveMSEState(routedSrc);
+    const totalBytes = (of.totalVideoBytes || 0) + (of.totalAudioBytes || 0);
+    const mode = getAggregateMSEStorageMode(of).toUpperCase();
+    const state = of.captureLimitReached
+      ? "partial"
+      : of.mseComplete
+        ? "complete"
+        : "capturing";
+
+    indicator.dataset.mode = mode.toLowerCase();
+    indicator.style.display = "flex";
+    indicator.querySelector(".omnifetch-mse-status-top").textContent =
+      `${mode} | ${formatBytes(totalBytes)}`;
+    indicator.querySelector(".omnifetch-mse-status-bottom").textContent =
+      formatExactBytes(totalBytes);
+    indicator.title =
+      `State: ${state}\n` +
+      `Total: ${formatExactBytes(totalBytes)}\n` +
+      `Video: ${formatExactBytes(of.totalVideoBytes || 0)} (${getMSETrackStorageMode(of, "video")})\n` +
+      `Audio: ${formatExactBytes(of.totalAudioBytes || 0)} (${getMSETrackStorageMode(of, "audio")})\n` +
+      `Chunks: video=${getMSETrackChunkCount(of, "video")}, audio=${getMSETrackChunkCount(of, "audio")}\n` +
+      `Active session: ${of.activeSessionId || "none"}`;
+  }
+
+  function isThirdPartyRedditEnabled() {
+    return !isStrictSecurityMode() && settings.enableThirdPartyReddit;
+  }
+
+  function rememberApprovedHost(cacheKey, host) {
+    approvedThirdPartyHosts.add(`${cacheKey}:${host.toLowerCase()}`);
+  }
+
+  function hasApprovedHost(cacheKey, host) {
+    return approvedThirdPartyHosts.has(`${cacheKey}:${host.toLowerCase()}`);
+  }
+
+  function confirmThirdPartyHost(url, serviceLabel, cacheKey) {
+    const safe = toHttpUrl(url);
+    if (!safe) {
+      return false;
+    }
+    if (hasApprovedHost(cacheKey, safe.host)) {
+      return true;
+    }
+    const approved = confirm(
+      `${serviceLabel} will open an external download page.\n\nHost: ${safe.host}\nURL: ${redactUrlForReport(safe.href)}\n\nOnly continue if you trust this destination.`,
+    );
+    if (approved) {
+      rememberApprovedHost(cacheKey, safe.host);
+    }
+    return approved;
+  }
+
+  function confirmSniffedManifestRoute(routeUrl) {
+    const safe = toHttpUrl(routeUrl);
+    if (!safe) {
+      return false;
+    }
+    if (approvedSniffHosts.has(safe.host.toLowerCase())) {
+      return true;
+    }
+    const approved = confirm(
+      `OmniFetch only detected this media route through network sniffing.\n\nHost: ${safe.host}\nRoute: ${redactUrlForReport(safe.href)}\n\nThis may belong to ads or unrelated media. Continue with this manifest?`,
+    );
+    if (approved) {
+      approvedSniffHosts.add(safe.host.toLowerCase());
+    }
+    return approved;
+  }
+
+  function getPreferredSniffRoute() {
+    const url = pickPreferredManifestUrl(sniffedManifestUrls);
+    return url ? buildSniffRoute(url) : null;
   }
 
   function maybeAutoDownloadMSE(
@@ -2815,7 +4028,7 @@
     }
 
     const of = syncActiveMSEState(source);
-    const hasVideo = (of.videoChunks || []).length > 0;
+    const hasVideo = hasMSETrackData(of, "video");
     if (!of.mseComplete || !hasVideo) {
       return;
     }
@@ -2987,6 +4200,12 @@
             .omnifetch-btn:active{transform:scale(0.95)}
             .omnifetch-small-btn{width:32px;height:32px;border-radius:16px;background:rgba(255,255,255,0.85)}
             #omnifetch-sniff-badge{position:absolute;top:-4px;right:-4px;background:#FF3B30;color:white;font-size:10px;font-weight:700;border-radius:10px;min-width:18px;height:18px;display:none;align-items:center;justify-content:center;line-height:1;padding:0 4px}
+            #omnifetch-mse-status{display:none;flex-direction:column;align-items:flex-end;gap:2px;min-width:198px;padding:8px 10px;border-radius:12px;background:rgba(12,18,28,0.88);color:#F5F7FA;box-shadow:0 6px 18px rgba(0,0,0,0.34);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px)}
+            #omnifetch-mse-status[data-mode="opfs"]{border:1px solid rgba(52,199,89,0.45)}
+            #omnifetch-mse-status[data-mode="memory"]{border:1px solid rgba(255,159,10,0.45)}
+            #omnifetch-mse-status[data-mode="mixed"]{border:1px solid rgba(175,82,222,0.45)}
+            .omnifetch-mse-status-top{font-size:11px;font-weight:700;letter-spacing:0.04em;text-transform:uppercase}
+            .omnifetch-mse-status-bottom{font-size:12px;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,monospace;line-height:1.2}
             #omnifetch-settings-panel{display:none;position:fixed;bottom:100px;right:20px;z-index:9999999;background:#1a1a2e;color:white;padding:20px;border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,0.5);font-family:system-ui;font-size:13px;min-width:280px}
             #omnifetch-settings-panel label{display:flex;justify-content:space-between;align-items:center;padding:6px 0;gap:12px}
             #omnifetch-settings-panel input[type=checkbox]{width:18px;height:18px;accent-color:#007AFF}
@@ -3038,11 +4257,16 @@
     btnWrap.style.cssText = "position:relative;display:inline-block";
     btnWrap.append(btn, badge);
 
+    const mseStatus = document.createElement("div");
+    mseStatus.id = "omnifetch-mse-status";
+    mseStatus.innerHTML =
+      '<div class="omnifetch-mse-status-top">MSE | 0 B</div><div class="omnifetch-mse-status-bottom">0 B</div>';
+
     const row = document.createElement("div");
     row.style.cssText = "display:flex;gap:6px;align-items:center";
     row.append(cancelBtn, settingsBtn);
 
-    buttonContainer.append(btnWrap, row);
+    buttonContainer.append(mseStatus, btnWrap, row);
     document.body.appendChild(buttonContainer);
 
     createSettingsPanel();
@@ -3072,9 +4296,10 @@
             <label>Network sniffing <input type="checkbox" id="of-sniff" ${settings.enableNetworkSniff ? "checked" : ""}></label>
             <label>Auto-download completed MSE <input type="checkbox" id="of-auto-mse" ${settings.autoDownloadMSE ? "checked" : ""}></label>
             <label>Remove iframe sandbox (risky) <input type="checkbox" id="of-strip-sandbox" ${settings.removeIframeSandbox ? "checked" : ""}></label>
+            <label>Reddit via RapidSave (3rd-party) <input type="checkbox" id="of-rd3p" ${settings.enableThirdPartyReddit ? "checked" : ""}></label>
             <label>YouTube 3rd-party converter <input type="checkbox" id="of-yt3p" ${settings.enableThirdPartyYT ? "checked" : ""}></label>
             <hr>
-            <label>MSE memory cap (MB) <input type="number" id="of-mse-cap" value="${settings.maxMSEMemoryMB}" min="64" max="8192"></label>
+            <label>MSE memory cap (MB) <input type="number" id="of-mse-cap" value="${settings.maxMSEMemoryMB}" min="${MIN_MSE_MEMORY_MB}" max="${HARD_MAX_MSE_MEMORY_MB}"></label>
             <label>HLS concurrency <input type="number" id="of-hls-conc" value="${settings.hlsConcurrency}" min="1" max="8"></label>
             <label>Sniffed URL cap <input type="number" id="of-sniff-cap" value="${settings.maxSniffedUrls}" min="20" max="2000"></label>
             <label>Request timeout (s) <input type="number" id="of-timeout" value="${settings.requestTimeoutBlob / 1000}" min="5" max="300"></label>
@@ -3103,9 +4328,16 @@
       settings.removeIframeSandbox =
         !isStrictModeEnabled &&
         document.getElementById("of-strip-sandbox").checked;
+      settings.enableThirdPartyReddit =
+        !isStrictModeEnabled && document.getElementById("of-rd3p").checked;
       settings.enableThirdPartyYT =
         !isStrictModeEnabled && document.getElementById("of-yt3p").checked;
-      settings.maxMSEMemoryMB = readIntegerInput("of-mse-cap", 6144, 64, 8192);
+      settings.maxMSEMemoryMB = readIntegerInput(
+        "of-mse-cap",
+        DEFAULT_MSE_MEMORY_MB,
+        MIN_MSE_MEMORY_MB,
+        HARD_MAX_MSE_MEMORY_MB,
+      );
       settings.hlsConcurrency = readIntegerInput("of-hls-conc", 4, 1, 8);
       settings.maxSniffedUrls = readIntegerInput("of-sniff-cap", 200, 20, 2000);
       settings.requestTimeoutBlob =
@@ -3121,7 +4353,7 @@
       const report = Log.exportReport();
       navigator.clipboard
         .writeText(report)
-        .then(() => alert("Debug report copied to clipboard!"))
+        .then(() => alert("Redacted debug report copied to clipboard!"))
         .catch(() => {
           // Fallback
           const ta = document.createElement("textarea");
@@ -3130,7 +4362,7 @@
           ta.select();
           document.execCommand("copy");
           ta.remove();
-          alert("Debug report copied!");
+          alert("Redacted debug report copied!");
         });
     };
   }
@@ -3204,6 +4436,18 @@
       }
       const js2 = JSON.parse(res2.responseText);
       if (js2.c_status === "CONVERTED" && js2.dlink) {
+        if (
+          !confirmThirdPartyHost(
+            js2.dlink,
+            "The YouTube converter",
+            "ytThirdPartyDownload",
+          )
+        ) {
+          if (tab) {
+            tab.close();
+          }
+          return;
+        }
         if (!navigateDetachedTab(tab, js2.dlink)) {
           throw new Error("Blocked unsafe converter download URL");
         }
@@ -3302,6 +4546,23 @@
           });
         });
       } else {
+        if (await maybeDownloadDirectToFile(safeUrl.href, filename, btn, dlId)) {
+          return;
+        }
+        const probe = await probeRemoteResource(safeUrl.href);
+        if (!Number.isFinite(probe.length)) {
+          throw new Error(
+            "Unable to determine a safe in-memory size for this file. Handing off to the browser download path instead.",
+          );
+        }
+        if (
+          Number.isFinite(probe.length) &&
+          probe.length > MAX_IN_MEMORY_DOWNLOAD_BYTES
+        ) {
+          throw new Error(
+            `Direct download is ${formatBytes(probe.length)}, which exceeds OmniFetch's safe in-memory limit. Use Tampermonkey GM_download or a Chromium browser with File System Access support for large files.`,
+          );
+        }
         const blob = await fetchBlob(safeUrl.href, (loaded, total) => {
           if (!isStale(dlId) && total) {
             setBtnProgress(btn, Math.round((loaded / total) * 100) + "%");
@@ -3336,11 +4597,12 @@
     setBtnProgress(btn, "⏳");
     try {
       const of = syncActiveMSEState(sourceUrl);
-      const vChunks = of.videoChunks || [];
-      const aChunks = of.audioChunks || [];
-      if (vChunks.length === 0) {
+      const hasVideo = hasMSETrackData(of, "video");
+      const hasAudio = hasMSETrackData(of, "audio");
+      let didDownload = false;
+      if (!hasVideo) {
         alert(
-          "No captured video chunks.\nLet the video play to completion first.",
+          "No captured video data.\nLet the video play to completion first.",
         );
         return;
       }
@@ -3351,12 +4613,32 @@
       const baseName = sanitizeFilenameSegment(
         document.title || "video_download",
       );
-      const videoBlob = createMediaBlob(vChunks, of.videoMime, "video/mp4");
-      if (aChunks.length > 0) {
-        const audioBlob = createMediaBlob(aChunks, of.audioMime, "audio/mp4");
+      const videoBlob = await getMSETrackBlob(
+        of,
+        "video",
+        sourceUrl,
+        "video/mp4",
+      );
+      if (hasAudio) {
+        const audioBlob = await getMSETrackBlob(
+          of,
+          "audio",
+          sourceUrl,
+          "audio/mp4",
+        );
         const muxPlan = buildMuxPlan(videoBlob.type, audioBlob.type);
         btn.innerHTML = svgMux;
-        const muxed = await muxVideoAudio(videoBlob, audioBlob, muxPlan);
+        let muxed = null;
+        try {
+          ensureMuxFitsMemory(
+            of.totalVideoBytes,
+            of.totalAudioBytes,
+            "MSE capture",
+          );
+          muxed = await muxVideoAudio(videoBlob, audioBlob, muxPlan);
+        } catch (muxGuardError) {
+          Log.warn(muxGuardError.message);
+        }
         if (isStale(dlId)) {
           return;
         }
@@ -3369,6 +4651,7 @@
               muxPlan.outputExt,
             ),
           );
+          didDownload = true;
         } else {
           triggerBlobDownload(
             videoBlob,
@@ -3390,12 +4673,17 @@
               ),
             500,
           );
+          didDownload = true;
         }
       } else {
         triggerBlobDownload(
           videoBlob,
           buildMediaFilename(baseName, videoBlob.type, "mp4"),
         );
+        didDownload = true;
+      }
+      if (didDownload) {
+        releaseActiveMSECapture(sourceUrl);
       }
     } catch (e) {
       if (!isStale(dlId)) {
@@ -3421,6 +4709,9 @@
     }
     const badge = document.getElementById("omnifetch-sniff-badge");
     const routedSrc = normalizeRouteSource(src);
+    const sniffRouteTarget = parseSniffRoute(routedSrc);
+
+    updateMSEStatusIndicator(routedSrc);
 
     if (badge && sniffedManifestUrls.length > 0) {
       badge.textContent = sniffedManifestUrls.length;
@@ -3439,16 +4730,56 @@
     }
 
     if (routedSrc.startsWith("reddit:") && settings.enableReddit) {
-      resetBtn(btn);
       const realUrl = routedSrc.split("reddit:")[1];
+      if (!isThirdPartyRedditEnabled()) {
+        btn.innerHTML = svgSettings;
+        btn.title = "Reddit third-party downloader is disabled";
+        btn.style.cursor = "pointer";
+        btn.onclick = (e) => {
+          e.preventDefault();
+          alert(
+            "Reddit third-party downloading is disabled.\n\nEnable 'Reddit via RapidSave (3rd-party)' in OmniFetch settings if you explicitly want to use RapidSave.",
+          );
+        };
+      } else {
+        resetBtn(btn);
+        btn.title = "Download Reddit media via RapidSave";
+        btn.onclick = (e) => {
+          e.preventDefault();
+          if (!isIdle()) {
+            return;
+          }
+          const rapidSaveUrl =
+            "https://rapidsave.com/info?url=" + encodeURIComponent(realUrl);
+          if (
+            !confirmThirdPartyHost(rapidSaveUrl, "RapidSave", "rapidSaveReddit")
+          ) {
+            return;
+          }
+          openInNewTab(rapidSaveUrl);
+        };
+      }
+    } else if (sniffRouteTarget) {
+      const safeSniffUrl = toHttpUrl(sniffRouteTarget);
+      resetBtn(btn);
+      btn.title = safeSniffUrl
+        ? `Download sniffed manifest from ${safeSniffUrl.host}`
+        : "Download sniffed manifest";
       btn.onclick = (e) => {
         e.preventDefault();
         if (!isIdle()) {
           return;
         }
-        openInNewTab(
-          "https://rapidsave.com/info?url=" + encodeURIComponent(realUrl),
-        );
+        if (!confirmSniffedManifestRoute(sniffRouteTarget)) {
+          return;
+        }
+        if (isDashManifestUrl(sniffRouteTarget)) {
+          triggerDASHDownload(sniffRouteTarget, btn);
+        } else if (isHlsManifestUrl(sniffRouteTarget)) {
+          triggerHLSDownload(sniffRouteTarget, btn);
+        } else {
+          alert("Unsupported sniffed manifest route.");
+        }
       };
     } else if (
       HOST.includes("youtube.com") &&
@@ -3485,8 +4816,8 @@
     } else if (isBlobUrl(routedSrc)) {
       const of = syncActiveMSEState(routedSrc);
       if (of.mseComplete) {
-        const hasAudio = (of.audioChunks || []).length > 0;
-        const hasVideo = (of.videoChunks || []).length > 0;
+        const hasAudio = hasMSETrackData(of, "audio");
+        const hasVideo = hasMSETrackData(of, "video");
         btn.innerHTML = hasAudio && hasVideo ? svgMux : svgCheck;
         btn.title = of.captureLimitReached
           ? "Download partial captured stream"
@@ -3595,7 +4926,8 @@
     video.dataset.omnifetchHandled = "true";
 
     const onPlaying = async () => {
-      const src = await extractDirectVideoSrc(video);
+      const src =
+        (await extractDirectVideoSrc(video)) || getPreferredSniffRoute();
       if (!src) {
         return;
       }
@@ -3615,7 +4947,8 @@
 
     const onEnded = async () => {
       if (video === activeVideoElement || !activeVideoElement) {
-        const src = await extractDirectVideoSrc(video);
+        const src =
+          (await extractDirectVideoSrc(video)) || getPreferredSniffRoute();
         if (src) {
           activeVideoSrc = src;
           if (isBlobUrl(src)) {
@@ -3632,7 +4965,8 @@
 
     // Passive pickup if nothing active yet
     if (!activeVideoSrc && (video.currentSrc || video.src)) {
-      extractDirectVideoSrc(video).then((src) => {
+      extractDirectVideoSrc(video).then((resolvedSrc) => {
+        const src = resolvedSrc || getPreferredSniffRoute();
         if (src && !activeVideoSrc) {
           activeVideoSrc = src;
           activeVideoElement = video;
@@ -3699,6 +5033,7 @@
   let lastKnownUrl = window.location.href;
   let mutationObserver = null;
   let rescanInterval = null;
+  let statusRefreshInterval = null;
 
   function resetState() {
     Log.info("Navigation reset");
@@ -3715,6 +5050,8 @@
 
     sniffedManifestUrls = [];
     sniffedManifestMeta.clear();
+    approvedSniffHosts.clear();
+    approvedThirdPartyHosts.clear();
     lastAutoMSESignature = "";
 
     try {
@@ -3725,9 +5062,14 @@
         } else {
           of.videoChunks = [];
           of.audioChunks = [];
+          of.videoChunkCount = 0;
+          of.audioChunkCount = 0;
           of.videoMime = "";
           of.audioMime = "";
+          of.videoStorageMode = "memory";
+          of.audioStorageMode = "memory";
           of.captureLimitReached = false;
+          of.captureStopReason = "";
           of.mseComplete = false;
           of.sniffedUrls = [];
           of.totalVideoBytes = 0;
@@ -3735,13 +5077,11 @@
           uWindow.video = of.videoChunks;
           uWindow.audio = of.audioChunks;
           uWindow.isComplete = 0;
-          uWindow.downloadAll = 0;
         }
       }
     } catch {
       // Ignore reset errors when page-script state is unavailable.
     }
-    uWindow.downloadAll = 0;
     uWindow.isComplete = 0;
 
     const badge = document.getElementById("omnifetch-sniff-badge");
@@ -3752,6 +5092,7 @@
     if (buttonContainer) {
       buttonContainer.style.display = "none";
     }
+    updateMSEStatusIndicator("");
     hideProgressOverlay();
   }
 
@@ -3769,6 +5110,12 @@
     scanForFrameworkPlayers();
     if (activeVideoSrc) {
       updateDownloadLink(activeVideoSrc);
+      return;
+    }
+    updateMSEStatusIndicator("");
+    const sniffRoute = getPreferredSniffRoute();
+    if (sniffRoute) {
+      updateDownloadLink(sniffRoute);
     }
   }
 
@@ -3851,10 +5198,6 @@
         stripIframeSandboxAttributes();
       }
 
-      if (uWindow.downloadAll === 1) {
-        triggerLegacyTrackDump(activeVideoSrc);
-      }
-
       // URL polling fallback for SPAs that bypass history hooks
       if (window.location.href !== lastKnownUrl) {
         onNavigationDetected(window.location.href);
@@ -3866,15 +5209,27 @@
         .forEach(handleVideo);
       // Check sniffed URLs when no video element is active
       if (!activeVideoSrc && sniffedManifestUrls.length > 0) {
-        const url = pickPreferredManifestUrl(sniffedManifestUrls);
-        if (url) {
-          activeVideoSrc = url;
-          updateDownloadLink(url);
+        const sniffRoute = getPreferredSniffRoute();
+        if (sniffRoute) {
+          updateDownloadLink(sniffRoute);
         }
+      }
+
+      if (activeVideoSrc && isBlobUrl(activeVideoSrc)) {
+        updateMSEStatusIndicator(activeVideoSrc);
       }
 
       maybeAutoDownloadMSE("interval");
     }, settings.rescanIntervalMs);
+
+    if (statusRefreshInterval) {
+      clearInterval(statusRefreshInterval);
+    }
+    statusRefreshInterval = setInterval(() => {
+      if (activeVideoSrc && isBlobUrl(activeVideoSrc)) {
+        updateMSEStatusIndicator(activeVideoSrc);
+      }
+    }, 1000);
   }
 
   // Cleanup on page unload
@@ -3889,6 +5244,9 @@
     }
     if (rescanInterval) {
       clearInterval(rescanInterval);
+    }
+    if (statusRefreshInterval) {
+      clearInterval(statusRefreshInterval);
     }
   });
 

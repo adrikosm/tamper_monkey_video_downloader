@@ -11,7 +11,7 @@ OmniFetch is a Tampermonkey userscript that adds a download workflow to sites th
 
 The project is intentionally **monolithic**. The entire runtime lives in a single userscript file, [omnifetch.js](./omnifetch.js), so installation and audit are straightforward.
 
-Current script version: `26.6`
+Current script version: `27.1`
 
 ## What OmniFetch Does
 OmniFetch combines several download strategies behind one floating UI:
@@ -30,6 +30,7 @@ OmniFetch combines several download strategies behind one floating UI:
   - representation selection
 - MSE/blob capture for players that never expose a direct file URL.
 - Optional FFmpeg.wasm mux/remux when separate audio and video tracks need to be combined.
+- Large direct and segmented downloads now prefer bounded-memory or disk-streaming paths instead of assembling unbounded blobs in memory.
 - Site-specific extraction for:
   - Telegram
   - Reddit
@@ -60,17 +61,21 @@ OmniFetch is broad by design, but the current build is hardened compared with a 
 Security defaults and controls:
 
 - `Strict security mode` is enabled by default.
+- Third-party service routes are opt-in and disabled in strict mode.
 - The optional 3rd-party YouTube converter is disabled by default.
+- The optional Reddit RapidSave route is disabled by default.
 - Remote FFmpeg assets are hash-verified before execution.
 - Unsafe or invalid non-HTTP(S) download URLs are blocked.
 - Sniffed manifest URLs are capped in memory.
+- Debug report copying redacts URLs and query strings by default.
 - Per-site enable/disable is available from the settings panel.
+- Large direct files and large HLS/DASH downloads are forced onto safe paths that avoid unbounded memory growth.
 
 Important scope note:
 
 - OmniFetch runs with `@match *://*/*` and `@connect *` because universal media downloading requires access across many sites and CDNs.
 - The normal direct/HLS/DASH/MSE paths do **not** upload your media to a remote service.
-- The only remote service path is the optional YouTube 3rd-party converter, and it remains opt-in.
+- The only third-party service paths are the optional YouTube converter and the optional Reddit RapidSave route, and both are opt-in.
 
 ## What OmniFetch Cannot Guarantee
 There are browser-level limits that no normal userscript can honestly claim to bypass in every case.
@@ -80,12 +85,14 @@ OmniFetch does **not** guarantee support for:
 - DRM / EME protected streams
 - encrypted HLS streams that require decryption keys outside the page context
 - sites that deliberately prevent all usable media access outside protected playback pipelines
-- extremely long blob/MSE sessions that exceed the configured in-memory capture cap
+- browser environments that do not expose a safe disk-write path for very large segmented downloads
 
-For long blob captures, OmniFetch now warns before downloading a partial capture instead of silently pretending it is complete.
+For long blob captures, OmniFetch now uses a disk-backed temporary spool when the browser exposes OPFS support. If that spool path is unavailable, OmniFetch falls back to the configured in-memory capture cap and may only export a partial capture.
 
 ## Browser Requirement
 You need a userscript manager. Tampermonkey is the recommended target.
+
+For multi-gigabyte blob/MSE capture, the practical target is a Chromium-based browser that supports the Origin Private File System (OPFS). On browsers without that storage path, OmniFetch falls back to the configured in-memory capture limit for blob streams.
 
 Official Tampermonkey browser pages and store links:
 
@@ -132,6 +139,16 @@ Button behavior depends on the detected route:
 - HLS: downloads segments and assembles them
 - DASH: downloads the selected representation and assembles it
 - blob/MSE: captures and exports the active buffered stream
+- sniffed manifest only: asks for confirmation before using a network-sniffed HLS/DASH route
+
+For blob/MSE routes, the floating UI now shows a live capture status pill with storage mode and exact byte count:
+
+- `OPFS`: disk-backed temporary capture
+- `MEMORY`: fallback in-memory capture
+- `MIXED`: tracks are using different backing modes
+
+For very large direct, HLS, or DASH downloads, OmniFetch now prefers disk-streaming or bounded-memory flows.
+If a route would exceed the safe in-memory limit and the browser cannot stream the file safely to disk, OmniFetch fails closed instead of exhausting memory.
 
 ### Telegram
 1. Open Telegram Web and play the target media.
@@ -139,7 +156,7 @@ Button behavior depends on the detected route:
 3. For blob/MSE playback, let the media finish loading whenever possible.
 4. If the stream uses separate audio and video tracks, OmniFetch will try to mux them.
 
-For long blob streams, if the capture limit is reached, OmniFetch warns that the download may be partial.
+For long blob streams, OmniFetch now prefers disk-backed capture. If the browser cannot provide that path, the configured fallback capture cap still applies and OmniFetch warns that the export may be partial.
 
 ## Settings Panel
 Use the floating gear button to configure the script for the current site and browser session.
@@ -156,7 +173,7 @@ Available settings include:
 - MSE memory cap
 - sniffed URL cap
 - retry count and request timeout
-- risky options such as iframe sandbox removal or the 3rd-party YouTube converter
+- risky options such as iframe sandbox removal, Reddit via RapidSave, or the 3rd-party YouTube converter
 
 ## Troubleshooting
 ### No download button appears
@@ -172,11 +189,25 @@ Available settings include:
 ### HLS or DASH download fails
 - Some manifests are encrypted or intentionally protected.
 - Some sites rotate tokens quickly or require request headers that expire mid-download.
+- Very large segmented downloads with separate audio/video tracks may be saved as separate files instead of being muxed in-browser.
 - Open the debug report from the settings panel to inspect the detected route and recent logs.
+
+### Very large downloads
+- Direct media downloads should handle multi-gigabyte files through Tampermonkey `GM_download`.
+- Large HLS and DASH downloads use disk-streaming when the browser supports the File System Access API.
+- On Chromium-class browsers with OPFS support, OmniFetch can spool very large blob/MSE captures to temporary browser storage instead of holding them in JS memory.
+- On supported browser paths, OmniFetch is now designed to handle downloads up to roughly `10 GB` without assembling the entire file in memory.
+- Very large split audio/video blob captures may still download as separate files when in-browser muxing would exceed safe FFmpeg memory limits.
+- If the browser cannot provide a safe disk-write path, OmniFetch now aborts large in-memory assembly instead of risking runaway memory or swap usage.
 
 ### FFmpeg does not load
 - The FFmpeg path only loads when mux/remux is needed.
 - If network policy or CSP blocks it, mux/remux may fail and OmniFetch will fall back where possible.
+
+### Reddit download opens a settings warning
+- OmniFetch will use direct Reddit routes when it can.
+- RapidSave is now an explicit opt-in fallback because it sends the Reddit URL to a third-party service.
+- Enable it only if you want that external route.
 
 ## Project Structure
 This repository is intentionally minimal.
